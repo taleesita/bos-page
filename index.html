@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v1.0-apr23 relevance-ranker';
+        const APP_VERSION = 'v1.2-apr23 retry-countdown';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -345,7 +345,36 @@ Respond with STRICT JSON ONLY matching this schema:
 }
 `;
 
-        const callGemini = async (apiKey, payload, folderIndex, originalFilename) => {
+        // Fetch wrapper that auto-retries on 429 by waiting the server-specified delay.
+        // Gemini's 429 response body includes details[].retryDelay (e.g. "28s").
+        // `onWait(secondsRemaining, attempt, maxRetries)` fires each second during the wait
+        // so the UI can show a live countdown.
+        const fetchWithRetryOn429 = async (url, opts, options = {}) => {
+            const { maxRetries = 2, onWait } = options;
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                const resp = await fetch(url, opts);
+                if (resp.status !== 429 || attempt === maxRetries) return resp;
+                // Parse retryDelay from error body
+                let retrySec = 30;
+                try {
+                    const body = await resp.clone().text();
+                    const err = JSON.parse(body);
+                    const retryInfo = err?.error?.details?.find(d =>
+                        (d['@type'] || '').includes('RetryInfo')
+                    );
+                    const s = retryInfo?.retryDelay;
+                    if (s) retrySec = Math.min(120, parseFloat(String(s).replace('s', '')) || 30);
+                } catch {}
+                console.warn(`[Bos Page] 429 — waiting ${retrySec}s before retry (${attempt + 1}/${maxRetries})`);
+                // Live countdown
+                for (let left = retrySec; left > 0; left--) {
+                    if (onWait) onWait(left, attempt + 1, maxRetries);
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+            }
+        };
+
+        const callGemini = async (apiKey, payload, folderIndex, originalFilename, onRateLimitWait) => {
             if (!apiKey) throw new Error('No Gemini API key set. Add one in Settings.');
             if (!folderIndex || !folderIndex.folders?.length) throw new Error('Folder index not ready. Wait for indexing.');
 
@@ -376,11 +405,11 @@ Respond with STRICT JSON ONLY matching this schema:
                 },
             };
 
-            const resp = await fetch(GEMINI_ENDPOINT(apiKey), {
+            const resp = await fetchWithRetryOn429(GEMINI_ENDPOINT(apiKey), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
-            });
+            }, { onWait: onRateLimitWait });
             if (!resp.ok) {
                 const err = await resp.text();
                 console.error('Gemini API error', resp.status, err);
@@ -813,14 +842,23 @@ Respond with STRICT JSON ONLY matching this schema:
             // Sequential queue — chained promises ensure Gemini calls run one at a time
             // with a small delay between. Keeps us well under free tier's 15 req/min cap.
             const geminiQueueRef = useRef(Promise.resolve());
-            const GEMINI_INTERVAL_MS = 1200; // ~50 req/min max — leaves headroom under the 15/min limit
+            const GEMINI_INTERVAL_MS = 5000; // ~12 req/min — stays under 2.0 Flash free tier's 15 RPM cap
 
             const runGeminiForItem = async (id, file) => {
                 try {
                     const { key, idx } = await waitForPrereqs(id);
                     updateItem(id, { status: 'processing', waitingReason: null });
                     const payload = await prepareFileForNaming(file);
-                    const proposal = await callGemini(key, payload, idx, file.name);
+                    // Countdown shown on the card while Gemini is rate-limited
+                    const onRateLimitWait = (sec, attempt, max) => {
+                        updateItem(id, {
+                            status: 'waiting',
+                            waitingReason: `Rate limited — retrying in ${sec}s (try ${attempt}/${max})`,
+                        });
+                    };
+                    const proposal = await callGemini(key, payload, idx, file.name, onRateLimitWait);
+                    // In case we just finished a rate-limit wait, flip back to processing briefly
+                    updateItem(id, { status: 'processing', waitingReason: null });
                     const folder = idx.folders.find(f => f.path === proposal.folder_path);
                     updateItem(id, {
                         status: 'ready',
