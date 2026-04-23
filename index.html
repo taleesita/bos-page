@@ -62,7 +62,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v0.1-apr22';
+        const APP_VERSION = 'v0.2-apr22 auth-fix';
 
         const FB_CONFIG = {
             apiKey: "AIzaSyByX1smy6AXwocShBRhqj29cnOW4q3BWLw",
@@ -382,9 +382,22 @@ Respond with STRICT JSON ONLY matching this schema:
         // ============================================================
         // AUTH — Firebase Google sign-in + Drive scope
         // ============================================================
-        const provider = new firebase.auth.GoogleAuthProvider();
-        GOOGLE_SCOPES.forEach(s => provider.addScope(s));
-        provider.setCustomParameters({ prompt: 'select_account' });
+        // Build a provider fresh each call — Firebase sometimes caches state
+        // on a reused provider and returns UserCredential with null credential.
+        const makeProvider = (prompt = 'select_account') => {
+            const p = new firebase.auth.GoogleAuthProvider();
+            GOOGLE_SCOPES.forEach(s => p.addScope(s));
+            p.setCustomParameters({ prompt });
+            return p;
+        };
+
+        // Extract accessToken from a UserCredential result; throws if missing.
+        const extractAccessToken = (result) => {
+            const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+            if (credential && credential.accessToken) return credential.accessToken;
+            console.error('No credential on result:', result);
+            throw new Error('Google did not return an access token. Try Sign out → sign in again.');
+        };
 
         const useAuth = () => {
             const [user, setUser] = useState(null);
@@ -413,18 +426,20 @@ Respond with STRICT JSON ONLY matching this schema:
                 return unsub;
             }, []);
 
+            const persistToken = (accessToken) => {
+                const expiry = Date.now() + 55 * 60 * 1000; // tokens last 1h, refresh at 55m
+                setToken(accessToken);
+                storage.set(STORAGE_KEYS.accessToken, accessToken);
+                storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
+            };
+
             const signIn = useCallback(async () => {
                 setError(null);
                 try {
-                    const result = await fbAuth.signInWithPopup(provider);
-                    const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-                    if (credential && credential.accessToken) {
-                        const expiry = Date.now() + 55 * 60 * 1000; // tokens last 1h, refresh at 55m
-                        setToken(credential.accessToken);
-                        storage.set(STORAGE_KEYS.accessToken, credential.accessToken);
-                        storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
-                    }
+                    const result = await fbAuth.signInWithPopup(makeProvider('select_account'));
+                    persistToken(extractAccessToken(result));
                 } catch (e) {
+                    console.error('signIn failed:', e);
                     setError(e.message || 'Sign-in failed');
                 }
             }, []);
@@ -438,20 +453,26 @@ Respond with STRICT JSON ONLY matching this schema:
                 await fbAuth.signOut();
             }, []);
 
-            // Re-request Drive token if missing/expired
+            // Re-request Drive token if missing/expired.
+            // If user is already signed in, use reauthenticateWithPopup with prompt=consent —
+            // this reliably returns a fresh credential with accessToken, whereas signInWithPopup
+            // can return a UserCredential with null credential when the user is already signed in.
             const refreshToken = useCallback(async () => {
+                setError(null);
                 try {
-                    const result = await fbAuth.signInWithPopup(provider);
-                    const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-                    if (credential && credential.accessToken) {
-                        const expiry = Date.now() + 55 * 60 * 1000;
-                        setToken(credential.accessToken);
-                        storage.set(STORAGE_KEYS.accessToken, credential.accessToken);
-                        storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
-                        return credential.accessToken;
+                    const currentUser = fbAuth.currentUser;
+                    let result;
+                    if (currentUser) {
+                        result = await currentUser.reauthenticateWithPopup(makeProvider('consent'));
+                    } else {
+                        result = await fbAuth.signInWithPopup(makeProvider('consent'));
                     }
+                    const accessToken = extractAccessToken(result);
+                    persistToken(accessToken);
+                    return accessToken;
                 } catch (e) {
-                    setError('Could not refresh Drive access: ' + e.message);
+                    console.error('refreshToken failed:', e);
+                    setError('Could not get Drive access: ' + (e.message || e));
                 }
                 return null;
             }, []);
@@ -1262,6 +1283,11 @@ Respond with STRICT JSON ONLY matching this schema:
                             >
                                 Grant access
                             </button>
+                            {error && (
+                                <div className="mt-4 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg p-3 text-left">
+                                    {error}
+                                </div>
+                            )}
                             <button
                                 onClick={signOut}
                                 className="mt-3 text-xs text-slate-500 underline"
