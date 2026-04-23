@@ -1,0 +1,1306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Bos Page</title>
+    <link rel="icon" href="apple-touch-icon.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Bos Page">
+    <meta name="theme-color" content="#ffffff">
+
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';</script>
+
+    <style>
+        * { -webkit-tap-highlight-color: transparent; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .fade-in { animation: fadeIn 0.3s ease-out; }
+        .spin { animation: spin 0.9s linear infinite; }
+        .pulse { animation: pulse 1.5s ease-in-out infinite; }
+        body { overscroll-behavior-y: none; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+    <div id="root"></div>
+
+    <script>
+        // Global error handler — catches Babel compile + runtime errors that would leave a blank page
+        window.onerror = function(msg, url, line, col, error) {
+            var root = document.getElementById('root');
+            if (root && !root.innerHTML.trim()) {
+                root.innerHTML = '<div style="padding:32px;font-family:system-ui;max-width:640px;margin:0 auto;">' +
+                    '<h2 style="color:#dc2626;margin:0 0 12px;">Something went wrong</h2>' +
+                    '<p style="color:#666;margin:0 0 16px;">The app failed to load. Details:</p>' +
+                    '<pre style="background:#fef2f2;padding:16px;border-radius:8px;overflow:auto;font-size:13px;color:#991b1b;white-space:pre-wrap;">' +
+                    msg + (line ? '\nLine: ' + line : '') + (col ? ', Col: ' + col : '') +
+                    (error && error.stack ? '\n\n' + error.stack : '') + '</pre>' +
+                    '<p style="color:#666;font-size:14px;margin-top:16px;">Try refreshing or clearing cache.</p></div>';
+            }
+        };
+    </script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+        // ============================================================
+        // CONSTANTS
+        // ============================================================
+        const APP_VERSION = 'v0.1-apr22';
+
+        const FB_CONFIG = {
+            apiKey: "AIzaSyByX1smy6AXwocShBRhqj29cnOW4q3BWLw",
+            authDomain: "bo-s-page.firebaseapp.com",
+            projectId: "bo-s-page",
+            storageBucket: "bo-s-page.firebasestorage.app",
+            messagingSenderId: "388095163990",
+            appId: "1:388095163990:web:9363400eea2595cf9e05f7"
+        };
+        firebase.initializeApp(FB_CONFIG);
+        const fbAuth = firebase.auth();
+
+        const ALLOWED_EMAILS = ['taly.matiteyahu@gmail.com', 'doug.pickard@gmail.com'];
+        const EMAIL_TO_NAME = {
+            'taly.matiteyahu@gmail.com': 'Taly',
+            'doug.pickard@gmail.com': 'Doug',
+        };
+
+        // The 8 top-level folders the app files into. Names are fetched from Drive on first load.
+        const ROOT_FOLDER_IDS = [
+            '1SrKvsj4kPzgiPVMbNLyYXAdR6zSHrnvf',
+            '1CvbXymJEZ6WFmwQy8laNYGf2oJeoXHjx',
+            '1masK55Ba7iCJt4BSsi768rw1V79jWA6G',
+            '1jBDesN7gZR44lXks7FBnZvY7xrj-gerB',
+            '1ZKB55vwayUPaYakyF8VHMNi9LXv6KnHo',
+            '1xGJwcmTEKcIFbbsfQ4_IJM5OCeX_EQfI',
+            '1YT5ITO7OzZSt2zjMWyeE-r73gRBaqCI3',
+            '1T-vFM3IHKFGtC2Sv_fc0kO4J2-DcfnPz',
+        ];
+
+        // Name of the Drive folder that the Apps Script drops email attachments into
+        const INTAKE_FOLDER_NAME = '📥 Pending Review';
+
+        // Parent used for [DUPE FOR TESTING] folders — same convention as expense tracker
+        // TODO: set to a real Drive folder ID after first-run test-mode setup
+        const TEST_PARENT_FOLDER_ID = '';
+
+        // Scopes needed from Google. drive = full Drive so we can rename + move into shared folders.
+        const GOOGLE_SCOPES = ['https://www.googleapis.com/auth/drive'];
+
+        const INDEX_TTL_MS = 24 * 60 * 60 * 1000; // 24h folder-index cache
+
+        // ============================================================
+        // STORAGE HELPERS (localStorage wrappers with try/catch)
+        // ============================================================
+        const storage = {
+            get: (k, fallback = null) => {
+                try { const v = localStorage.getItem(k); return v == null ? fallback : v; } catch { return fallback; }
+            },
+            set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+            getJSON: (k, fallback = null) => {
+                try { const v = localStorage.getItem(k); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
+            },
+            setJSON: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+            del: (k) => { try { localStorage.removeItem(k); } catch {} },
+        };
+
+        const STORAGE_KEYS = {
+            geminiKey: 'bospage_gemini_key',
+            testMode: 'bospage_test_mode',
+            accessToken: 'bospage_google_access_token',
+            accessTokenExpiry: 'bospage_google_access_token_expiry',
+            folderIndex: 'bospage_folder_index',
+            folderIndexTs: 'bospage_folder_index_ts',
+            activeTab: 'bospage_active_tab',
+        };
+
+        // ============================================================
+        // GOOGLE DRIVE API WRAPPERS
+        // ============================================================
+        const drive = {
+            // List children of a folder (supports pagination)
+            listChildren: async (token, folderId, pageToken) => {
+                const params = new URLSearchParams({
+                    q: `'${folderId}' in parents and trashed = false`,
+                    fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)',
+                    pageSize: '1000',
+                    orderBy: 'name',
+                });
+                if (pageToken) params.set('pageToken', pageToken);
+                const resp = await fetch(`https://www.googleapis.com/drive/v3/files?${params}`, {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                if (!resp.ok) throw new Error(`Drive list failed: ${resp.status}`);
+                return resp.json();
+            },
+            // Fetch a single file/folder's metadata
+            getMeta: async (token, fileId) => {
+                const resp = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,mimeType,parents,webViewLink`, {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                if (!resp.ok) throw new Error(`Drive get failed: ${resp.status}`);
+                return resp.json();
+            },
+            // Upload a new file (multipart) with name + parent
+            uploadNew: async (token, file, name, parentId) => {
+                const metadata = { name, parents: [parentId] };
+                const boundary = 'foo_' + Math.random().toString(36).slice(2);
+                const body = new Blob([
+                    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+                    JSON.stringify(metadata) + `\r\n--${boundary}\r\nContent-Type: ${file.type || 'application/octet-stream'}\r\n\r\n`,
+                    file,
+                    `\r\n--${boundary}--`
+                ]);
+                const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+                    body,
+                });
+                if (!resp.ok) throw new Error(`Drive upload failed: ${resp.status} ${await resp.text()}`);
+                return resp.json();
+            },
+            // Rename + change parent of an existing file (used when filing email intake items)
+            renameAndMove: async (token, fileId, newName, newParentId, oldParentIds) => {
+                const params = new URLSearchParams({
+                    addParents: newParentId,
+                    removeParents: (oldParentIds || []).join(','),
+                    fields: 'id,name,webViewLink',
+                });
+                const resp = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?${params}`, {
+                    method: 'PATCH',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName }),
+                });
+                if (!resp.ok) throw new Error(`Drive patch failed: ${resp.status} ${await resp.text()}`);
+                return resp.json();
+            },
+            // Create a subfolder under a parent
+            createFolder: async (token, name, parentId) => {
+                const resp = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,name', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] }),
+                });
+                if (!resp.ok) throw new Error(`Create folder failed: ${resp.status}`);
+                return resp.json();
+            },
+            // Download a file's contents as a Blob
+            download: async (token, fileId) => {
+                const resp = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+                return resp.blob();
+            },
+        };
+
+        // ============================================================
+        // FILE PROCESSING — PDF text, Tesseract OCR, image data URLs
+        // ============================================================
+        const fileUtils = {
+            readAsDataURL: (file) => new Promise((resolve, reject) => {
+                const r = new FileReader();
+                r.onload = () => resolve(r.result);
+                r.onerror = () => reject(r.error);
+                r.readAsDataURL(file);
+            }),
+            readAsArrayBuffer: (file) => new Promise((resolve, reject) => {
+                const r = new FileReader();
+                r.onload = () => resolve(r.result);
+                r.onerror = () => reject(r.error);
+                r.readAsArrayBuffer(file);
+            }),
+        };
+
+        // Extract native text from a PDF (page 1 + 2 only, sufficient for naming)
+        const extractPdfText = async (file) => {
+            if (!window.pdfjsLib) return '';
+            const buf = await fileUtils.readAsArrayBuffer(file);
+            const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+            const pages = Math.min(pdf.numPages, 2);
+            let text = '';
+            for (let i = 1; i <= pages; i++) {
+                const page = await pdf.getPage(i);
+                const content = await page.getTextContent();
+                text += content.items.map(x => x.str).join(' ') + '\n';
+            }
+            return text.trim();
+        };
+
+        // Render PDF page 1 to a data URL for vision fallback
+        const pdfFirstPageToDataUrl = async (file) => {
+            if (!window.pdfjsLib) return null;
+            const buf = await fileUtils.readAsArrayBuffer(file);
+            const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+            const page = await pdf.getPage(1);
+            const viewport = page.getViewport({ scale: 1.5 });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+            return canvas.toDataURL('image/jpeg', 0.7);
+        };
+
+        // Decide what payload to send to Gemini for a given file:
+        //   - image → send image inline + let Gemini do vision
+        //   - PDF with native text → send text
+        //   - scanned/image PDF → render page 1 as image, send inline
+        //   - other → send text dump of filename
+        const prepareFileForNaming = async (file) => {
+            const type = file.type || '';
+            if (type.startsWith('image/')) {
+                const dataUrl = await fileUtils.readAsDataURL(file);
+                return { kind: 'image', mimeType: type, dataUrl, textHint: file.name };
+            }
+            if (type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+                try {
+                    const text = await extractPdfText(file);
+                    if (text && text.length > 30) {
+                        return { kind: 'text', text, textHint: file.name };
+                    }
+                    // scanned PDF — send page 1 as image
+                    const dataUrl = await pdfFirstPageToDataUrl(file);
+                    if (dataUrl) {
+                        return { kind: 'image', mimeType: 'image/jpeg', dataUrl, textHint: file.name };
+                    }
+                } catch (e) {
+                    console.warn('PDF extract failed, falling back to filename only', e);
+                }
+            }
+            // fallback — just use the filename
+            return { kind: 'text', text: `File name: ${file.name}`, textHint: file.name };
+        };
+
+        // ============================================================
+        // GEMINI API CLIENT
+        // ============================================================
+        const GEMINI_MODEL = 'gemini-2.5-flash';
+        const GEMINI_ENDPOINT = (key) =>
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
+
+        // Build the folder-index summary that goes into the prompt.
+        // Each folder gets its path + up to 12 example filenames.
+        const formatFolderIndex = (folders) => {
+            const lines = [];
+            for (const f of folders) {
+                lines.push(`PATH: ${f.path} [id=${f.id}]`);
+                if (f.files && f.files.length) {
+                    const examples = f.files.slice(-12);
+                    for (const n of examples) lines.push(`  - ${n}`);
+                } else {
+                    lines.push(`  (empty)`);
+                }
+            }
+            return lines.join('\n');
+        };
+
+        const NAMING_PROMPT = `You are a personal document filing assistant. Your job is to look at a document and decide:
+1. Which existing Drive folder it belongs in
+2. What filename to give it that matches the naming convention of that folder
+
+RULES:
+- Pick ONE folder from the list below. Use its exact path.
+- Study the example filenames in that folder and MATCH THE PATTERN (date format, ordering, words used, separators, casing, extension).
+- If dates appear in the pattern, use the document's date — not today's date.
+- Keep file extension from the original file.
+- If uncertain, lower your confidence score.
+
+Respond with STRICT JSON ONLY matching this schema:
+{
+  "folder_path": "the exact path string from the list",
+  "filename": "the new filename with extension",
+  "confidence": 0.0 to 1.0,
+  "reasoning": "one short sentence on why"
+}
+`;
+
+        const callGemini = async (apiKey, payload, folderIndex, originalFilename) => {
+            if (!apiKey) throw new Error('No Gemini API key set. Add one in Settings.');
+            if (!folderIndex || !folderIndex.folders?.length) throw new Error('Folder index not ready. Wait for indexing.');
+
+            const folderBlock = formatFolderIndex(folderIndex.folders);
+            const parts = [
+                { text: NAMING_PROMPT },
+                { text: `\nAVAILABLE FOLDERS:\n${folderBlock}\n` },
+                { text: `\nORIGINAL FILENAME: ${originalFilename}\n` },
+            ];
+            if (payload.kind === 'text') {
+                parts.push({ text: `\nDOCUMENT TEXT:\n${payload.text.slice(0, 30000)}` });
+            } else if (payload.kind === 'image') {
+                const base64 = payload.dataUrl.split(',')[1];
+                parts.push({ inline_data: { mime_type: payload.mimeType, data: base64 } });
+                parts.push({ text: '\n(Document is the image above — read it and extract what you need.)' });
+            }
+
+            const body = {
+                contents: [{ parts }],
+                generationConfig: {
+                    temperature: 0.2,
+                    responseMimeType: 'application/json',
+                },
+            };
+
+            const resp = await fetch(GEMINI_ENDPOINT(apiKey), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!resp.ok) {
+                const err = await resp.text();
+                throw new Error(`Gemini API error ${resp.status}: ${err.slice(0, 300)}`);
+            }
+            const data = await resp.json();
+            const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            let parsed;
+            try {
+                parsed = JSON.parse(txt);
+            } catch {
+                // If model wrapped in backticks or anything, try to salvage
+                const m = txt.match(/\{[\s\S]*\}/);
+                if (!m) throw new Error('Gemini returned unparseable response: ' + txt.slice(0, 200));
+                parsed = JSON.parse(m[0]);
+            }
+            return parsed;
+        };
+
+        // ============================================================
+        // AUTH — Firebase Google sign-in + Drive scope
+        // ============================================================
+        const provider = new firebase.auth.GoogleAuthProvider();
+        GOOGLE_SCOPES.forEach(s => provider.addScope(s));
+        provider.setCustomParameters({ prompt: 'select_account' });
+
+        const useAuth = () => {
+            const [user, setUser] = useState(null);
+            const [token, setToken] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+
+            useEffect(() => {
+                // Restore token from storage if still valid
+                const stored = storage.get(STORAGE_KEYS.accessToken);
+                const expiry = parseInt(storage.get(STORAGE_KEYS.accessTokenExpiry, '0'), 10);
+                if (stored && expiry > Date.now()) setToken(stored);
+
+                const unsub = fbAuth.onAuthStateChanged(u => {
+                    if (u && ALLOWED_EMAILS.includes(u.email)) {
+                        setUser(u);
+                    } else if (u) {
+                        setError(`${u.email} is not authorized for this app.`);
+                        fbAuth.signOut();
+                        setUser(null);
+                    } else {
+                        setUser(null);
+                    }
+                    setLoading(false);
+                });
+                return unsub;
+            }, []);
+
+            const signIn = useCallback(async () => {
+                setError(null);
+                try {
+                    const result = await fbAuth.signInWithPopup(provider);
+                    const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+                    if (credential && credential.accessToken) {
+                        const expiry = Date.now() + 55 * 60 * 1000; // tokens last 1h, refresh at 55m
+                        setToken(credential.accessToken);
+                        storage.set(STORAGE_KEYS.accessToken, credential.accessToken);
+                        storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
+                    }
+                } catch (e) {
+                    setError(e.message || 'Sign-in failed');
+                }
+            }, []);
+
+            const signOut = useCallback(async () => {
+                storage.del(STORAGE_KEYS.accessToken);
+                storage.del(STORAGE_KEYS.accessTokenExpiry);
+                storage.del(STORAGE_KEYS.folderIndex);
+                storage.del(STORAGE_KEYS.folderIndexTs);
+                setToken(null);
+                await fbAuth.signOut();
+            }, []);
+
+            // Re-request Drive token if missing/expired
+            const refreshToken = useCallback(async () => {
+                try {
+                    const result = await fbAuth.signInWithPopup(provider);
+                    const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+                    if (credential && credential.accessToken) {
+                        const expiry = Date.now() + 55 * 60 * 1000;
+                        setToken(credential.accessToken);
+                        storage.set(STORAGE_KEYS.accessToken, credential.accessToken);
+                        storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
+                        return credential.accessToken;
+                    }
+                } catch (e) {
+                    setError('Could not refresh Drive access: ' + e.message);
+                }
+                return null;
+            }, []);
+
+            return { user, token, loading, error, signIn, signOut, refreshToken };
+        };
+
+        // ============================================================
+        // UI: Sign-in screen
+        // ============================================================
+        const SignInScreen = ({ onSignIn, error }) => (
+            <div className="min-h-screen flex items-center justify-center p-6">
+                <div className="max-w-sm w-full text-center fade-in">
+                    <div className="text-5xl mb-4">📂</div>
+                    <h1 className="text-2xl font-semibold mb-2">Bos Page</h1>
+                    <p className="text-slate-500 text-sm mb-8">
+                        Drag, drop, and forward documents — we'll file them in Drive with the right name and folder.
+                    </p>
+                    <button
+                        onClick={onSignIn}
+                        className="w-full bg-slate-900 text-white rounded-xl px-4 py-3 font-medium active:scale-[0.98] transition"
+                    >
+                        Sign in with Google
+                    </button>
+                    {error && (
+                        <div className="mt-4 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg p-3">
+                            {error}
+                        </div>
+                    )}
+                    <div className="mt-8 text-xs text-slate-400">{APP_VERSION}</div>
+                </div>
+            </div>
+        );
+
+        // ============================================================
+        // UI: Loading spinner
+        // ============================================================
+        const Spinner = ({ size = 16, className = '' }) => (
+            <svg className={`spin ${className}`} width={size} height={size} viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeOpacity="0.2" strokeWidth="3"/>
+                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+            </svg>
+        );
+
+        // ============================================================
+        // UI: Tab bar
+        // ============================================================
+        const TABS = [
+            { id: 'upload', label: 'Upload', emoji: '📤' },
+            { id: 'inbox', label: 'Inbox', emoji: '📥' },
+            { id: 'settings', label: 'Settings', emoji: '⚙️' },
+        ];
+
+        const TabBar = ({ activeTab, setActiveTab }) => (
+            <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-slate-200 pb-safe z-20 md:static md:border-none md:bg-transparent">
+                <div className="max-w-2xl mx-auto flex md:justify-center md:gap-2">
+                    {TABS.map(t => (
+                        <button
+                            key={t.id}
+                            onClick={() => setActiveTab(t.id)}
+                            className={`flex-1 md:flex-initial md:px-5 py-3 md:py-2 md:rounded-full md:my-2 flex flex-col md:flex-row items-center justify-center gap-1 text-xs md:text-sm font-medium transition ${
+                                activeTab === t.id
+                                    ? 'text-slate-900 md:bg-slate-900 md:text-white'
+                                    : 'text-slate-500 hover:text-slate-700'
+                            }`}
+                        >
+                            <span className="text-lg md:text-base">{t.emoji}</span>
+                            {t.label}
+                        </button>
+                    ))}
+                </div>
+            </nav>
+        );
+
+        // ============================================================
+        // UI: Header
+        // ============================================================
+        const Header = ({ user, testMode, indexStatus }) => (
+            <header className="sticky top-0 bg-white/80 backdrop-blur border-b border-slate-200 z-10">
+                <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        <span className="text-xl">📂</span>
+                        <span className="font-semibold">Bos Page</span>
+                        {testMode && (
+                            <span className="text-[10px] font-semibold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">
+                                TEST
+                            </span>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-slate-500">
+                        {indexStatus && (
+                            <span className="hidden sm:inline">{indexStatus}</span>
+                        )}
+                        <span>{EMAIL_TO_NAME[user.email] || user.email}</span>
+                    </div>
+                </div>
+            </header>
+        );
+
+        // ============================================================
+        // REVIEW CARD — shared by Upload and Inbox tabs
+        // Represents one file in various states (processing, proposing, filing, done).
+        // ============================================================
+        const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip }) => {
+            const { status, originalName, proposal, edits, error, webViewLink } = item;
+            const folderOptions = useMemo(
+                () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
+                [folderIndex]
+            );
+
+            const confidenceColor = (c) => c >= 0.8 ? 'bg-emerald-100 text-emerald-700' : c >= 0.5 ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700';
+
+            return (
+                <div className="bg-white rounded-2xl border border-slate-200 p-4 fade-in">
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                        <div className="min-w-0 flex-1">
+                            <div className="text-xs text-slate-400 mb-1">Original</div>
+                            <div className="text-sm font-medium text-slate-700 truncate">{originalName}</div>
+                        </div>
+                        {proposal && (
+                            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${confidenceColor(proposal.confidence || 0)}`}>
+                                {Math.round((proposal.confidence || 0) * 100)}%
+                            </span>
+                        )}
+                    </div>
+
+                    {status === 'processing' && (
+                        <div className="flex items-center gap-2 text-sm text-slate-500">
+                            <Spinner size={14} /> Analyzing document…
+                        </div>
+                    )}
+
+                    {status === 'error' && (
+                        <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg p-3">
+                            {error}
+                            <button onClick={() => onSkip(item.id)} className="block mt-2 text-xs underline">Dismiss</button>
+                        </div>
+                    )}
+
+                    {status === 'done' && (
+                        <div className="flex items-center justify-between text-sm text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-lg p-3">
+                            <span>✓ Filed as <span className="font-medium">{edits.filename}</span></span>
+                            {webViewLink && (
+                                <a href={webViewLink} target="_blank" rel="noopener" className="text-xs underline">Open</a>
+                            )}
+                        </div>
+                    )}
+
+                    {(status === 'ready' || status === 'uploading') && (
+                        <>
+                            <div className="mb-3">
+                                <label className="block text-xs text-slate-500 mb-1">Folder</label>
+                                <select
+                                    value={edits.folderId || ''}
+                                    onChange={e => onChange(item.id, { ...edits, folderId: e.target.value })}
+                                    disabled={status === 'uploading'}
+                                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-slate-400 bg-white"
+                                >
+                                    {folderOptions.map(f => (
+                                        <option key={f.id} value={f.id}>{f.path}</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div className="mb-3">
+                                <label className="block text-xs text-slate-500 mb-1">Filename</label>
+                                <input
+                                    type="text"
+                                    value={edits.filename || ''}
+                                    onChange={e => onChange(item.id, { ...edits, filename: e.target.value })}
+                                    disabled={status === 'uploading'}
+                                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-slate-400"
+                                />
+                            </div>
+                            {proposal?.reasoning && (
+                                <div className="text-xs text-slate-500 mb-3 italic">💭 {proposal.reasoning}</div>
+                            )}
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => onConfirm(item.id)}
+                                    disabled={status === 'uploading' || !edits.folderId || !edits.filename}
+                                    className="flex-1 bg-slate-900 text-white rounded-lg py-2 text-sm font-medium active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2"
+                                >
+                                    {status === 'uploading' ? <><Spinner size={14}/> Filing…</> : 'File it'}
+                                </button>
+                                <button
+                                    onClick={() => onSkip(item.id)}
+                                    disabled={status === 'uploading'}
+                                    className="px-4 bg-slate-100 text-slate-700 rounded-lg py-2 text-sm font-medium active:scale-[0.98]"
+                                >
+                                    Skip
+                                </button>
+                            </div>
+                        </>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================
+        // UploadTab — drag-drop + review cards
+        // ============================================================
+        const UploadTab = ({ token, folderIndex, apiKey, testMode, refreshIndex }) => {
+            const [items, setItems] = useState([]);
+            const [isDragging, setIsDragging] = useState(false);
+            const fileInputRef = useRef(null);
+            const dragCounter = useRef(0);
+
+            const updateItem = (id, patch) => {
+                setItems(prev => prev.map(it => it.id === id ? { ...it, ...patch } : it));
+            };
+
+            const processFile = async (file) => {
+                const id = Math.random().toString(36).slice(2);
+                setItems(prev => [...prev, {
+                    id, file, originalName: file.name, status: 'processing',
+                    proposal: null, edits: { folderId: '', filename: '' }, error: null, webViewLink: null,
+                }]);
+                try {
+                    const payload = await prepareFileForNaming(file);
+                    const proposal = await callGemini(apiKey, payload, folderIndex, file.name);
+
+                    // Map folder_path back to folder id
+                    const folder = folderIndex.folders.find(f => f.path === proposal.folder_path);
+                    updateItem(id, {
+                        status: 'ready',
+                        proposal,
+                        edits: {
+                            folderId: folder?.id || folderIndex.folders[0]?.id || '',
+                            filename: proposal.filename || file.name,
+                        },
+                    });
+                } catch (e) {
+                    updateItem(id, { status: 'error', error: e.message });
+                }
+            };
+
+            const onFilesSelected = (fileList) => {
+                const files = Array.from(fileList);
+                if (!files.length) return;
+                if (!apiKey) {
+                    alert('Add a Gemini API key in Settings first.');
+                    return;
+                }
+                if (!folderIndex) {
+                    alert('Folder index is still loading. Try again in a moment.');
+                    return;
+                }
+                files.forEach(processFile);
+            };
+
+            const onDragEnter = (e) => {
+                e.preventDefault();
+                dragCounter.current++;
+                if (e.dataTransfer?.items?.length) setIsDragging(true);
+            };
+            const onDragLeave = (e) => {
+                e.preventDefault();
+                dragCounter.current--;
+                if (dragCounter.current <= 0) { setIsDragging(false); dragCounter.current = 0; }
+            };
+            const onDragOver = (e) => { e.preventDefault(); };
+            const onDrop = (e) => {
+                e.preventDefault();
+                setIsDragging(false);
+                dragCounter.current = 0;
+                if (e.dataTransfer?.files?.length) onFilesSelected(e.dataTransfer.files);
+            };
+
+            const handleConfirm = async (id) => {
+                const it = items.find(x => x.id === id);
+                if (!it) return;
+                updateItem(id, { status: 'uploading' });
+                try {
+                    // In test mode, route to test parent folder if configured; else just prefix filename
+                    const targetFolderId = testMode && TEST_PARENT_FOLDER_ID
+                        ? TEST_PARENT_FOLDER_ID
+                        : it.edits.folderId;
+                    const filename = testMode ? `[TEST] ${it.edits.filename}` : it.edits.filename;
+                    const uploaded = await drive.uploadNew(token, it.file, filename, targetFolderId);
+                    updateItem(id, {
+                        status: 'done',
+                        edits: { ...it.edits, filename },
+                        webViewLink: uploaded.webViewLink,
+                    });
+                } catch (e) {
+                    updateItem(id, { status: 'error', error: 'Upload failed: ' + e.message });
+                }
+            };
+
+            const handleSkip = (id) => {
+                setItems(prev => prev.filter(x => x.id !== id));
+            };
+
+            const handleChange = (id, edits) => updateItem(id, { edits });
+
+            const clearDone = () => setItems(prev => prev.filter(x => x.status !== 'done'));
+            const doneCount = items.filter(x => x.status === 'done').length;
+
+            return (
+                <div
+                    className="p-4 pb-8 relative"
+                    onDragEnter={onDragEnter}
+                    onDragLeave={onDragLeave}
+                    onDragOver={onDragOver}
+                    onDrop={onDrop}
+                >
+                    {isDragging && (
+                        <div className="fixed inset-0 bg-slate-900/20 backdrop-blur-sm z-50 flex items-center justify-center pointer-events-none">
+                            <div className="bg-white rounded-3xl px-10 py-8 shadow-xl border-2 border-dashed border-slate-900">
+                                <div className="text-5xl mb-3 text-center">📥</div>
+                                <div className="text-lg font-semibold">Drop to file</div>
+                            </div>
+                        </div>
+                    )}
+
+                    <button
+                        onClick={() => fileInputRef.current?.click()}
+                        className="w-full border-2 border-dashed border-slate-300 rounded-2xl p-8 text-center hover:border-slate-400 hover:bg-white transition"
+                    >
+                        <div className="text-4xl mb-2">📤</div>
+                        <div className="text-sm font-medium text-slate-700 mb-1">Drop files or tap to choose</div>
+                        <div className="text-xs text-slate-500">PDFs, images, or anything else</div>
+                    </button>
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        onChange={(e) => { onFilesSelected(e.target.files); e.target.value = ''; }}
+                        className="hidden"
+                    />
+
+                    {items.length > 0 && (
+                        <div className="mt-6 space-y-3">
+                            <div className="flex items-center justify-between">
+                                <h3 className="text-sm font-semibold text-slate-700">
+                                    {items.length} file{items.length === 1 ? '' : 's'}
+                                </h3>
+                                {doneCount > 0 && (
+                                    <button onClick={clearDone} className="text-xs text-slate-500 underline">
+                                        Clear {doneCount} filed
+                                    </button>
+                                )}
+                            </div>
+                            {items.map(it => (
+                                <ReviewCard
+                                    key={it.id}
+                                    item={it}
+                                    folderIndex={folderIndex}
+                                    onChange={handleChange}
+                                    onConfirm={handleConfirm}
+                                    onSkip={handleSkip}
+                                />
+                            ))}
+                        </div>
+                    )}
+
+                    {!apiKey && items.length === 0 && (
+                        <div className="mt-8 text-center text-sm text-amber-700 bg-amber-50 border border-amber-100 rounded-xl p-4">
+                            Add a Gemini API key in Settings to start filing.
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================
+        // InboxTab — files in "📥 Pending Review" from email intake
+        // ============================================================
+        const InboxTab = ({ token, folderIndex, apiKey, testMode }) => {
+            const [items, setItems] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [intakeFolderId, setIntakeFolderId] = useState(null);
+            const [error, setError] = useState(null);
+
+            const findIntakeFolder = async () => {
+                // Search Drive for the intake folder by name
+                const params = new URLSearchParams({
+                    q: `name = '${INTAKE_FOLDER_NAME.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+                    fields: 'files(id,name)',
+                });
+                const resp = await fetch(`https://www.googleapis.com/drive/v3/files?${params}`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                if (!resp.ok) throw new Error(`Drive search failed: ${resp.status}`);
+                const data = await resp.json();
+                return data.files?.[0]?.id || null;
+            };
+
+            const load = useCallback(async () => {
+                setLoading(true);
+                setError(null);
+                try {
+                    let folderId = intakeFolderId;
+                    if (!folderId) {
+                        folderId = await findIntakeFolder();
+                        setIntakeFolderId(folderId);
+                    }
+                    if (!folderId) {
+                        setItems([]);
+                        setError(`No "${INTAKE_FOLDER_NAME}" folder found. Once the Apps Script runs once it'll be created automatically.`);
+                        return;
+                    }
+                    const data = await drive.listChildren(token, folderId);
+                    const files = (data.files || []).filter(f => f.mimeType !== 'application/vnd.google-apps.folder');
+                    // Convert to item shape with empty proposal — user needs to process each
+                    setItems(files.map(f => ({
+                        id: f.id,
+                        driveId: f.id,
+                        originalName: f.name,
+                        mimeType: f.mimeType,
+                        status: 'pending',
+                        proposal: null,
+                        edits: { folderId: '', filename: '' },
+                        error: null,
+                        webViewLink: null,
+                    })));
+                } catch (e) {
+                    setError(e.message);
+                } finally {
+                    setLoading(false);
+                }
+            }, [token, intakeFolderId]);
+
+            useEffect(() => { load(); /* eslint-disable-next-line */ }, [token]);
+
+            const processItem = async (itemId) => {
+                const it = items.find(x => x.id === itemId);
+                if (!it) return;
+                if (!apiKey) { alert('Add a Gemini API key in Settings first.'); return; }
+                setItems(prev => prev.map(x => x.id === itemId ? { ...x, status: 'processing' } : x));
+                try {
+                    const blob = await drive.download(token, it.driveId);
+                    const file = new File([blob], it.originalName, { type: it.mimeType });
+                    const payload = await prepareFileForNaming(file);
+                    const proposal = await callGemini(apiKey, payload, folderIndex, it.originalName);
+                    const folder = folderIndex.folders.find(f => f.path === proposal.folder_path);
+                    setItems(prev => prev.map(x => x.id === itemId ? {
+                        ...x,
+                        status: 'ready',
+                        proposal,
+                        edits: {
+                            folderId: folder?.id || folderIndex.folders[0]?.id || '',
+                            filename: proposal.filename || x.originalName,
+                        },
+                    } : x));
+                } catch (e) {
+                    setItems(prev => prev.map(x => x.id === itemId ? { ...x, status: 'error', error: e.message } : x));
+                }
+            };
+
+            const processAll = () => {
+                items.filter(i => i.status === 'pending').forEach(i => processItem(i.id));
+            };
+
+            const handleConfirm = async (itemId) => {
+                const it = items.find(x => x.id === itemId);
+                if (!it) return;
+                setItems(prev => prev.map(x => x.id === itemId ? { ...x, status: 'uploading' } : x));
+                try {
+                    const targetFolderId = testMode && TEST_PARENT_FOLDER_ID ? TEST_PARENT_FOLDER_ID : it.edits.folderId;
+                    const filename = testMode ? `[TEST] ${it.edits.filename}` : it.edits.filename;
+                    // Move (change parent) + rename, since file is already in Drive
+                    const updated = await drive.renameAndMove(
+                        token, it.driveId, filename, targetFolderId, [intakeFolderId]
+                    );
+                    setItems(prev => prev.map(x => x.id === itemId ? {
+                        ...x,
+                        status: 'done',
+                        edits: { ...x.edits, filename },
+                        webViewLink: updated.webViewLink,
+                    } : x));
+                } catch (e) {
+                    setItems(prev => prev.map(x => x.id === itemId ? { ...x, status: 'error', error: 'Move failed: ' + e.message } : x));
+                }
+            };
+
+            const handleSkip = (itemId) => {
+                setItems(prev => prev.filter(x => x.id !== itemId));
+            };
+
+            const handleChange = (itemId, edits) => {
+                setItems(prev => prev.map(x => x.id === itemId ? { ...x, edits } : x));
+            };
+
+            const pendingCount = items.filter(x => x.status === 'pending').length;
+
+            return (
+                <div className="p-4 pb-8">
+                    <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-sm font-semibold text-slate-700">
+                            📥 Pending Review {items.length > 0 ? `(${items.length})` : ''}
+                        </h3>
+                        <div className="flex gap-2">
+                            {pendingCount > 1 && (
+                                <button
+                                    onClick={processAll}
+                                    className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-medium active:scale-[0.98]"
+                                >
+                                    Analyze all ({pendingCount})
+                                </button>
+                            )}
+                            <button
+                                onClick={load}
+                                className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-lg text-xs font-medium active:scale-[0.98]"
+                            >
+                                {loading ? <Spinner size={12}/> : 'Refresh'}
+                            </button>
+                        </div>
+                    </div>
+
+                    {loading && items.length === 0 && (
+                        <div className="text-center py-8 text-slate-400">
+                            <Spinner size={20} className="mx-auto" />
+                        </div>
+                    )}
+
+                    {error && (
+                        <div className="text-sm text-slate-600 bg-slate-100 rounded-xl p-4">
+                            {error}
+                        </div>
+                    )}
+
+                    {!loading && !error && items.length === 0 && (
+                        <div className="text-center py-12 text-slate-500">
+                            <div className="text-4xl mb-2">📭</div>
+                            <p className="text-sm">Nothing waiting. Forward a file to the intake inbox to add one.</p>
+                        </div>
+                    )}
+
+                    <div className="space-y-3">
+                        {items.map(it => (
+                            <div key={it.id}>
+                                {it.status === 'pending' ? (
+                                    <div className="bg-white rounded-2xl border border-slate-200 p-4 flex items-center justify-between gap-3 fade-in">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="text-sm font-medium text-slate-700 truncate">{it.originalName}</div>
+                                            <div className="text-xs text-slate-400 mt-0.5">From email intake</div>
+                                        </div>
+                                        <button
+                                            onClick={() => processItem(it.id)}
+                                            className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-medium active:scale-[0.98]"
+                                        >
+                                            Analyze
+                                        </button>
+                                        <button
+                                            onClick={() => handleSkip(it.id)}
+                                            className="text-xs text-slate-400 underline"
+                                        >
+                                            Skip
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <ReviewCard
+                                        item={it}
+                                        folderIndex={folderIndex}
+                                        onChange={handleChange}
+                                        onConfirm={handleConfirm}
+                                        onSkip={handleSkip}
+                                    />
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            );
+        };
+
+        const SettingsTab = ({ user, apiKey, setApiKey, testMode, setTestMode, refreshIndex, indexStatus, signOut, regrant }) => {
+            const [keyInput, setKeyInput] = useState(apiKey || '');
+            const [saved, setSaved] = useState(false);
+
+            const saveKey = () => {
+                const trimmed = keyInput.trim();
+                if (trimmed) {
+                    storage.set(STORAGE_KEYS.geminiKey, trimmed);
+                    setApiKey(trimmed);
+                    setSaved(true);
+                    setTimeout(() => setSaved(false), 1500);
+                }
+            };
+
+            const clearKey = () => {
+                storage.del(STORAGE_KEYS.geminiKey);
+                setApiKey('');
+                setKeyInput('');
+            };
+
+            return (
+                <div className="p-4 max-w-2xl mx-auto space-y-6">
+                    <section className="bg-white rounded-2xl p-5 border border-slate-200">
+                        <h3 className="font-semibold mb-1">Gemini API Key</h3>
+                        <p className="text-xs text-slate-500 mb-3">
+                            Generate at <a className="underline" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com/app/apikey</a>. Stored in this browser only.
+                        </p>
+                        <div className="flex gap-2">
+                            <input
+                                type="password"
+                                value={keyInput}
+                                onChange={e => setKeyInput(e.target.value)}
+                                placeholder="AIza..."
+                                className="flex-1 px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-slate-400"
+                            />
+                            <button
+                                onClick={saveKey}
+                                className="px-4 py-2 bg-slate-900 text-white rounded-lg text-sm font-medium active:scale-[0.98]"
+                            >
+                                {saved ? '✓' : 'Save'}
+                            </button>
+                        </div>
+                        {apiKey && (
+                            <button onClick={clearKey} className="mt-2 text-xs text-slate-500 underline">Clear saved key</button>
+                        )}
+                    </section>
+
+                    <section className="bg-white rounded-2xl p-5 border border-slate-200">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <h3 className="font-semibold">Test mode</h3>
+                                <p className="text-xs text-slate-500 mt-1">Routes uploads to [DUPE FOR TESTING] folders instead of real ones.</p>
+                            </div>
+                            <button
+                                onClick={() => setTestMode(!testMode)}
+                                className={`relative w-12 h-7 rounded-full transition ${testMode ? 'bg-amber-500' : 'bg-slate-200'}`}
+                            >
+                                <span className={`absolute top-0.5 w-6 h-6 bg-white rounded-full transition ${testMode ? 'left-[22px]' : 'left-0.5'}`} />
+                            </button>
+                        </div>
+                    </section>
+
+                    <section className="bg-white rounded-2xl p-5 border border-slate-200">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <h3 className="font-semibold">Folder index</h3>
+                                <p className="text-xs text-slate-500 mt-1">{indexStatus || 'Not loaded.'}</p>
+                            </div>
+                            <button
+                                onClick={refreshIndex}
+                                className="px-3 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium active:scale-[0.98]"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+                    </section>
+
+                    <section className="bg-white rounded-2xl p-5 border border-slate-200">
+                        <h3 className="font-semibold mb-3">Account</h3>
+                        <div className="text-sm text-slate-600 mb-3">{user.email}</div>
+                        <div className="flex gap-2 flex-wrap">
+                            <button
+                                onClick={signOut}
+                                className="px-3 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium active:scale-[0.98]"
+                            >
+                                Sign out
+                            </button>
+                            <button
+                                onClick={regrant}
+                                className="px-3 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium active:scale-[0.98]"
+                            >
+                                Re-grant Drive access
+                            </button>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-3">
+                            Use Re-grant if you changed OAuth scopes or see 403 errors on uploads.
+                        </p>
+                    </section>
+
+                    <div className="text-center text-xs text-slate-400 pt-4">{APP_VERSION}</div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // APP
+        // ============================================================
+        const App = () => {
+            const { user, token, loading, error, signIn, signOut, refreshToken } = useAuth();
+            const [activeTab, setActiveTab] = useState(storage.get(STORAGE_KEYS.activeTab, 'upload'));
+            const [apiKey, setApiKey] = useState(storage.get(STORAGE_KEYS.geminiKey, ''));
+            const [testMode, setTestModeState] = useState(storage.get(STORAGE_KEYS.testMode) === 'true');
+            const [folderIndex, setFolderIndex] = useState(storage.getJSON(STORAGE_KEYS.folderIndex));
+            const [indexStatus, setIndexStatus] = useState('');
+
+            useEffect(() => { storage.set(STORAGE_KEYS.activeTab, activeTab); }, [activeTab]);
+
+            const setTestMode = (v) => {
+                setTestModeState(v);
+                storage.set(STORAGE_KEYS.testMode, String(v));
+            };
+
+            // Recursively walk the 8 root folders, collecting every subfolder's path
+            // and up to MAX_EXAMPLES filenames per folder. Cached in localStorage.
+            const refreshIndex = useCallback(async () => {
+                if (!token) return;
+                const MAX_EXAMPLES_PER_FOLDER = 40;
+                const FOLDER_MIME = 'application/vnd.google-apps.folder';
+                const folders = []; // { id, name, path, rootId, files: [names] }
+                let folderCount = 0;
+                let fileCount = 0;
+
+                setIndexStatus('Starting index…');
+
+                // Fetch all children of a folder, paginating
+                const getAllChildren = async (folderId) => {
+                    let all = [];
+                    let pageToken = undefined;
+                    do {
+                        const data = await drive.listChildren(token, folderId, pageToken);
+                        all = all.concat(data.files || []);
+                        pageToken = data.nextPageToken;
+                    } while (pageToken);
+                    return all;
+                };
+
+                // BFS from a root folder
+                const walkRoot = async (rootId) => {
+                    const rootMeta = await drive.getMeta(token, rootId);
+                    const queue = [{ id: rootMeta.id, name: rootMeta.name, path: rootMeta.name, rootId: rootMeta.id }];
+                    while (queue.length) {
+                        const cur = queue.shift();
+                        let children;
+                        try {
+                            children = await getAllChildren(cur.id);
+                        } catch (e) {
+                            console.warn('Failed to list', cur.path, e);
+                            continue;
+                        }
+                        const fileNames = [];
+                        for (const c of children) {
+                            if (c.mimeType === FOLDER_MIME) {
+                                queue.push({
+                                    id: c.id,
+                                    name: c.name,
+                                    path: `${cur.path} / ${c.name}`,
+                                    rootId: cur.rootId,
+                                });
+                            } else {
+                                fileNames.push(c.name);
+                                fileCount++;
+                            }
+                        }
+                        // Keep a cap per-folder so the LLM context doesn't blow up
+                        const examples = fileNames.slice(-MAX_EXAMPLES_PER_FOLDER);
+                        folders.push({
+                            id: cur.id,
+                            name: cur.name,
+                            path: cur.path,
+                            rootId: cur.rootId,
+                            files: examples,
+                        });
+                        folderCount++;
+                        setIndexStatus(`Indexing… ${folderCount} folders, ${fileCount} files`);
+                    }
+                };
+
+                try {
+                    // Roots in parallel, BFS within each root is sequential to respect rate limits
+                    await Promise.all(ROOT_FOLDER_IDS.map(walkRoot));
+                    const idx = { folders, indexedAt: Date.now() };
+                    setFolderIndex(idx);
+                    try {
+                        storage.setJSON(STORAGE_KEYS.folderIndex, idx);
+                        storage.set(STORAGE_KEYS.folderIndexTs, String(Date.now()));
+                    } catch (e) {
+                        // If localStorage overflows (big index), keep in-memory only
+                        console.warn('Index too big to cache, keeping in memory only', e);
+                    }
+                    setIndexStatus(`${folderCount} folders · ${fileCount} files · just now`);
+                } catch (e) {
+                    setIndexStatus('Index failed: ' + e.message);
+                }
+            }, [token]);
+
+            // Auto-build index on first token acquisition if we don't have one cached or it's stale
+            useEffect(() => {
+                if (!token) return;
+                const ts = parseInt(storage.get(STORAGE_KEYS.folderIndexTs, '0'), 10);
+                if (!folderIndex || Date.now() - ts > INDEX_TTL_MS) {
+                    refreshIndex();
+                } else {
+                    const fileCount = (folderIndex.folders || []).reduce((s, f) => s + (f.files?.length || 0), 0);
+                    const age = Math.round((Date.now() - ts) / 60000);
+                    setIndexStatus(`${folderIndex.folders?.length || 0} folders · ${fileCount} files · ${age}m ago`);
+                }
+            }, [token]);
+
+            if (loading) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center">
+                        <Spinner size={28} className="text-slate-400" />
+                    </div>
+                );
+            }
+
+            if (!user) {
+                return <SignInScreen onSignIn={signIn} error={error} />;
+            }
+
+            // Signed in but no Drive token — happens after cache clear / first-time
+            if (!token) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-6">
+                        <div className="max-w-sm w-full text-center fade-in">
+                            <div className="text-5xl mb-4">🔑</div>
+                            <p className="text-sm text-slate-600 mb-6">Need to grant Drive access to continue.</p>
+                            <button
+                                onClick={refreshToken}
+                                className="w-full bg-slate-900 text-white rounded-xl px-4 py-3 font-medium active:scale-[0.98] transition"
+                            >
+                                Grant access
+                            </button>
+                            <button
+                                onClick={signOut}
+                                className="mt-3 text-xs text-slate-500 underline"
+                            >
+                                Sign out
+                            </button>
+                        </div>
+                    </div>
+                );
+            }
+
+            const tabProps = { token, folderIndex, refreshIndex, apiKey, testMode };
+
+            return (
+                <div className="min-h-screen pb-20 md:pb-4">
+                    <Header user={user} testMode={testMode} indexStatus={indexStatus} />
+                    <main className="max-w-2xl mx-auto">
+                        {activeTab === 'upload' && <UploadTab {...tabProps} />}
+                        {activeTab === 'inbox' && <InboxTab {...tabProps} />}
+                        {activeTab === 'settings' && (
+                            <SettingsTab
+                                user={user}
+                                apiKey={apiKey}
+                                setApiKey={setApiKey}
+                                testMode={testMode}
+                                setTestMode={setTestMode}
+                                refreshIndex={refreshIndex}
+                                indexStatus={indexStatus}
+                                signOut={signOut}
+                                regrant={refreshToken}
+                            />
+                        )}
+                    </main>
+                    <TabBar activeTab={activeTab} setActiveTab={setActiveTab} />
+                </div>
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
