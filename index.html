@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v0.8-apr22 2.0flash+fullerr';
+        const APP_VERSION = 'v1.0-apr23 relevance-ranker';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -289,19 +289,40 @@
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
 
         // Build the folder-index summary that goes into the prompt.
-        // Each folder gets its path + up to 12 example filenames.
+        // Each folder gets its path + up to 3 example filenames.
+        // Empty folders are skipped — they provide no naming-pattern signal and
+        // bloat the prompt. Large indexes would blow past Gemini's free-tier token limits.
         const formatFolderIndex = (folders) => {
             const lines = [];
             for (const f of folders) {
+                if (!f.files || !f.files.length) continue; // skip empty folders
                 lines.push(`PATH: ${f.path} [id=${f.id}]`);
-                if (f.files && f.files.length) {
-                    const examples = f.files.slice(-12);
-                    for (const n of examples) lines.push(`  - ${n}`);
-                } else {
-                    lines.push(`  (empty)`);
-                }
+                const examples = f.files.slice(-3);
+                for (const n of examples) lines.push(`  - ${n}`);
             }
             return lines.join('\n');
+        };
+
+        // Rank folders by keyword-overlap with the document text. Returns top N.
+        // This keeps the prompt small regardless of how many folders exist.
+        // If the document has no text (image-only), scores are all 0 — we fall back
+        // to picking folders with the most existing files (assumed most active).
+        const rankFoldersByRelevance = (folders, docText, topN = 150) => {
+            const tokenize = (s) => (s || '').toLowerCase().match(/[a-z0-9]{3,}/g) || [];
+            const docTokens = new Set(tokenize(docText));
+            const scored = folders
+                .filter(f => f.files?.length)
+                .map(f => {
+                    let score = 0;
+                    for (const t of tokenize(f.path)) if (docTokens.has(t)) score += 3;
+                    for (const name of f.files) {
+                        for (const t of tokenize(name)) if (docTokens.has(t)) score += 1;
+                    }
+                    return { f, score };
+                });
+            // Primary: relevance score. Tiebreaker: folders with more example files (more active).
+            scored.sort((a, b) => (b.score - a.score) || ((b.f.files?.length || 0) - (a.f.files?.length || 0)));
+            return scored.slice(0, topN).map(x => x.f);
         };
 
         const NAMING_PROMPT = `You are a personal document filing assistant. Your job is to look at a document and decide:
@@ -328,7 +349,12 @@ Respond with STRICT JSON ONLY matching this schema:
             if (!apiKey) throw new Error('No Gemini API key set. Add one in Settings.');
             if (!folderIndex || !folderIndex.folders?.length) throw new Error('Folder index not ready. Wait for indexing.');
 
-            const folderBlock = formatFolderIndex(folderIndex.folders);
+            // Only include folders relevant to this document — keeps prompt under free-tier token caps
+            const docText = payload.kind === 'text' ? payload.text : '';
+            const rankedFolders = rankFoldersByRelevance(folderIndex.folders, docText, 150);
+            const folderBlock = formatFolderIndex(rankedFolders);
+            // Rough estimate: 4 chars per token
+            console.log(`[Bos Page] Pre-ranked ${rankedFolders.length}/${folderIndex.folders.length} folders → ${folderBlock.length.toLocaleString()} chars (~${Math.round(folderBlock.length/4).toLocaleString()} tokens)`);
             const parts = [
                 { text: NAMING_PROMPT },
                 { text: `\nAVAILABLE FOLDERS:\n${folderBlock}\n` },
@@ -1290,7 +1316,7 @@ Respond with STRICT JSON ONLY matching this schema:
             // and up to MAX_EXAMPLES filenames per folder. Cached in localStorage.
             const refreshIndex = useCallback(async () => {
                 if (!token) return;
-                const MAX_EXAMPLES_PER_FOLDER = 40;
+                const MAX_EXAMPLES_PER_FOLDER = 10;
                 const FOLDER_MIME = 'application/vnd.google-apps.folder';
                 const folders = []; // { id, name, path, rootId, files: [names] }
                 const visited = new Set(); // folder IDs we've already walked — prevents duplicate walks
