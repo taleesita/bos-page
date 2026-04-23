@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v0.6-apr22 jsdelivr-cdn';
+        const APP_VERSION = 'v0.8-apr22 2.0flash+fullerr';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -284,7 +284,7 @@
         // ============================================================
         // GEMINI API CLIENT
         // ============================================================
-        const GEMINI_MODEL = 'gemini-2.5-flash';
+        const GEMINI_MODEL = 'gemini-2.0-flash';
         const GEMINI_ENDPOINT = (key) =>
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
 
@@ -357,7 +357,8 @@ Respond with STRICT JSON ONLY matching this schema:
             });
             if (!resp.ok) {
                 const err = await resp.text();
-                throw new Error(`Gemini API error ${resp.status}: ${err.slice(0, 300)}`);
+                console.error('Gemini API error', resp.status, err);
+                throw new Error(`Gemini API error ${resp.status}: ${err}`);
             }
             const data = await resp.json();
             const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -639,7 +640,7 @@ Respond with STRICT JSON ONLY matching this schema:
         // REVIEW CARD — shared by Upload and Inbox tabs
         // Represents one file in various states (processing, proposing, filing, done).
         // ============================================================
-        const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip }) => {
+        const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip, onRetry }) => {
             const { status, originalName, proposal, edits, error, webViewLink, waitingReason } = item;
             const folderOptions = useMemo(
                 () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
@@ -681,7 +682,12 @@ Respond with STRICT JSON ONLY matching this schema:
                     {status === 'error' && (
                         <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg p-3">
                             {error}
-                            <button onClick={() => onSkip(item.id)} className="block mt-2 text-xs underline">Dismiss</button>
+                            <div className="flex gap-3 mt-2 text-xs">
+                                {onRetry && (
+                                    <button onClick={() => onRetry(item.id)} className="underline font-medium">Retry</button>
+                                )}
+                                <button onClick={() => onSkip(item.id)} className="underline">Dismiss</button>
+                            </div>
                         </div>
                     )}
 
@@ -778,20 +784,17 @@ Respond with STRICT JSON ONLY matching this schema:
                 }
             };
 
-            const processFile = async (file) => {
-                const id = Math.random().toString(36).slice(2);
-                setItems(prev => [...prev, {
-                    id, file, originalName: file.name, status: 'waiting',
-                    proposal: null, edits: { folderId: '', filename: '' }, error: null, webViewLink: null,
-                    waitingReason: 'Queued…',
-                }]);
+            // Sequential queue — chained promises ensure Gemini calls run one at a time
+            // with a small delay between. Keeps us well under free tier's 15 req/min cap.
+            const geminiQueueRef = useRef(Promise.resolve());
+            const GEMINI_INTERVAL_MS = 1200; // ~50 req/min max — leaves headroom under the 15/min limit
+
+            const runGeminiForItem = async (id, file) => {
                 try {
                     const { key, idx } = await waitForPrereqs(id);
                     updateItem(id, { status: 'processing', waitingReason: null });
                     const payload = await prepareFileForNaming(file);
                     const proposal = await callGemini(key, payload, idx, file.name);
-
-                    // Map folder_path back to folder id
                     const folder = idx.folders.find(f => f.path === proposal.folder_path);
                     updateItem(id, {
                         status: 'ready',
@@ -802,8 +805,38 @@ Respond with STRICT JSON ONLY matching this schema:
                         },
                     });
                 } catch (e) {
-                    updateItem(id, { status: 'error', error: e.message });
+                    // Friendlier message for rate-limit errors
+                    let msg = e.message || String(e);
+                    if (msg.includes('429') || /quota|rate/i.test(msg)) {
+                        msg = 'Rate limited by Gemini (free tier allows 15 req/min). Wait a minute and retry.';
+                    }
+                    updateItem(id, { status: 'error', error: msg });
                 }
+            };
+
+            const processFile = (file) => {
+                const id = Math.random().toString(36).slice(2);
+                setItems(prev => [...prev, {
+                    id, file, originalName: file.name, status: 'waiting',
+                    proposal: null, edits: { folderId: '', filename: '' }, error: null, webViewLink: null,
+                    waitingReason: 'Queued…',
+                }]);
+                // Chain onto the queue so calls run sequentially
+                geminiQueueRef.current = geminiQueueRef.current.then(async () => {
+                    await runGeminiForItem(id, file);
+                    await new Promise(r => setTimeout(r, GEMINI_INTERVAL_MS));
+                });
+            };
+
+            // Retry a failed file — re-queue it
+            const retryItem = (id) => {
+                const it = items.find(x => x.id === id);
+                if (!it) return;
+                updateItem(id, { status: 'waiting', error: null, waitingReason: 'Retrying…' });
+                geminiQueueRef.current = geminiQueueRef.current.then(async () => {
+                    await runGeminiForItem(id, it.file);
+                    await new Promise(r => setTimeout(r, GEMINI_INTERVAL_MS));
+                });
             };
 
             const onFilesSelected = (fileList) => {
@@ -914,6 +947,7 @@ Respond with STRICT JSON ONLY matching this schema:
                                     onChange={handleChange}
                                     onConfirm={handleConfirm}
                                     onSkip={handleSkip}
+                                    onRetry={retryItem}
                                 />
                             ))}
                         </div>
