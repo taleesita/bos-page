@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v1.2-apr23 retry-countdown';
+        const APP_VERSION = 'v2.1-apr23 manual-heuristic';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -301,6 +301,124 @@
                 for (const n of examples) lines.push(`  - ${n}`);
             }
             return lines.join('\n');
+        };
+
+        // Extract a likely document date from extracted text. Returns {year, month, day} or null.
+        const extractDocDate = (text) => {
+            if (!text) return null;
+            // YYYY-MM-DD or YYYY/MM/DD
+            let m = text.match(/\b(20\d{2})[-\/](0?[1-9]|1[0-2])[-\/](0?[1-9]|[12]\d|3[01])\b/);
+            if (m) return { year: m[1], month: m[2].padStart(2, '0'), day: m[3].padStart(2, '0') };
+            // MM/DD/YYYY
+            m = text.match(/\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/(20\d{2})\b/);
+            if (m) return { year: m[3], month: m[1].padStart(2, '0'), day: m[2].padStart(2, '0') };
+            // Month DD, YYYY
+            const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+            const mRegex = new RegExp(`\\b(${months.join('|')})\\s+(\\d{1,2}),?\\s+(20\\d{2})`, 'i');
+            m = text.match(mRegex);
+            if (m) {
+                const mo = months.indexOf(m[1].toLowerCase()) + 1;
+                return { year: m[3], month: String(mo).padStart(2, '0'), day: m[2].padStart(2, '0') };
+            }
+            return null;
+        };
+
+        // Guess a brand/company name and doc type from OCR text. Used for non-date
+        // filename patterns like "COMPANY - DOC TYPE.pdf" (typical for product manuals).
+        // Rough heuristic — expect to miss ~30% of the time. Review card lets user fix.
+        const guessCompanyAndType = (text) => {
+            if (!text) return { company: null, type: null };
+            const head = text.slice(0, 1500);
+            const stop = new Set([
+                'The','This','Your','User','Owner','Model','Serial','Please','Read',
+                'Before','After','For','And','With','Thank','Table','Contents','Chapter',
+                'Section','Page','Note','Warning','Caution','Important','Safety',
+            ]);
+            // Find candidate capitalized words/brands in order of appearance
+            const seen = new Set();
+            let company = null;
+            const re = /\b([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]+)?)\b/g;
+            let m;
+            while ((m = re.exec(head))) {
+                const w = m[1];
+                const first = w.split(/\s+/)[0];
+                if (stop.has(first) || seen.has(w)) continue;
+                seen.add(w);
+                company = w;
+                break;
+            }
+            // Detect doc type
+            let type = null;
+            const typeMatch = head.match(/\b(user\s+(?:manual|guide)|owner'?s\s+manual|installation\s+guide|quick\s+start(?:\s+guide)?|warranty|instructions?|reference\s+guide|setup\s+guide)\b/i);
+            if (typeMatch) {
+                type = typeMatch[1].replace(/\s+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            }
+            return { company, type };
+        };
+
+        // Local (no-LLM) proposer: rank folders by keyword overlap, adapt filename pattern
+        // from the folder's most recent existing filename by swapping in the doc's date.
+        const proposeLocally = (folders, docText, originalFilename) => {
+            const ranked = rankFoldersByRelevance(folders, docText, 3);
+            const topFolder = ranked[0];
+
+            const ext = (originalFilename.match(/\.[a-z0-9]+$/i) || [''])[0];
+            const baseOriginal = originalFilename.replace(/\.[a-z0-9]+$/i, '');
+            const docDate = extractDocDate(docText);
+            let filename = originalFilename;
+            let reasoning;
+
+            if (topFolder?.files?.length) {
+                // Use the most recent filename in that folder as a template
+                const example = topFolder.files[topFolder.files.length - 1];
+                const exampleExt = (example.match(/\.[a-z0-9]+$/i) || [''])[0];
+                const exampleBase = example.replace(/\.[a-z0-9]+$/i, '');
+                let adapted = exampleBase;
+                let note = '';
+
+                if (docDate) {
+                    // Date-bearing pattern (YYYY-MM, YYYY-MM-DD) → swap in doc's date
+                    adapted = adapted.replace(/\b20\d{2}[-\/]\d{2}[-\/]\d{2}\b/, `${docDate.year}-${docDate.month}-${docDate.day}`);
+                    adapted = adapted.replace(/\b20\d{2}[-\/]\d{2}\b/, `${docDate.year}-${docDate.month}`);
+                    if (adapted !== exampleBase) {
+                        note = `adapted from "${example}" using doc date ${docDate.year}-${docDate.month}-${docDate.day}`;
+                    }
+                }
+                // "COMPANY - TITLE" pattern (typical for product manuals) → try to substitute
+                if (adapted === exampleBase && /\s-\s/.test(exampleBase)) {
+                    const parts = exampleBase.split(/\s-\s/);
+                    const { company, type } = guessCompanyAndType(docText);
+                    if (company || type) {
+                        adapted = [
+                            company || parts[0],
+                            type || parts.slice(1).join(' - '),
+                        ].join(' - ');
+                        note = `detected "${company || '?'}" / "${type || '?'}" from the document`;
+                    }
+                }
+
+                filename = adapted + (exampleExt || ext);
+                reasoning = note
+                    ? `Matched "${topFolder.name}"; ${note}.`
+                    : `Matched "${topFolder.name}" by keyword. Couldn't auto-adapt filename — please edit.`;
+            } else if (topFolder) {
+                // Folder has no examples — fall back to docdate + original base
+                if (docDate) {
+                    filename = `${docDate.year}-${docDate.month}-${docDate.day} ${baseOriginal}${ext}`;
+                    reasoning = `Matched "${topFolder.name}" by keyword. Folder is empty — prefixed original name with doc date.`;
+                } else {
+                    reasoning = `Matched "${topFolder.name}" by keyword. Folder is empty, no date found — keeping original filename.`;
+                }
+            } else {
+                reasoning = `No keyword match. Pick a folder and adjust filename manually.`;
+            }
+
+            return {
+                folder_path: topFolder?.path || '',
+                filename,
+                confidence: topFolder ? 0.5 : 0.2,
+                reasoning,
+            };
         };
 
         // Rank folders by keyword-overlap with the document text. Returns top N.
@@ -824,15 +942,13 @@ Respond with STRICT JSON ONLY matching this schema:
             useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
             useEffect(() => { folderIndexRef.current = folderIndex; }, [folderIndex]);
 
-            // Wait for folder index + api key to be ready. Polls every 500ms.
+            // Wait for folder index to be ready. API key is optional — if absent we
+            // use local pattern matching instead of Gemini.
             const waitForPrereqs = async (id) => {
                 while (true) {
-                    const key = apiKeyRef.current;
                     const idx = folderIndexRef.current;
-                    if (key && idx && idx.folders?.length) return { key, idx };
-                    // Update waiting reason so the card shows what's missing
-                    const reason = !key ? 'Waiting for Gemini API key (Settings)…'
-                                 : !idx ? 'Waiting for folder index to start…'
+                    if (idx && idx.folders?.length) return { key: apiKeyRef.current, idx };
+                    const reason = !idx ? 'Waiting for folder index to start…'
                                  : 'Waiting for folder indexing to finish…';
                     updateItem(id, { status: 'waiting', error: null, waitingReason: reason });
                     await new Promise(r => setTimeout(r, 500));
@@ -849,16 +965,31 @@ Respond with STRICT JSON ONLY matching this schema:
                     const { key, idx } = await waitForPrereqs(id);
                     updateItem(id, { status: 'processing', waitingReason: null });
                     const payload = await prepareFileForNaming(file);
-                    // Countdown shown on the card while Gemini is rate-limited
-                    const onRateLimitWait = (sec, attempt, max) => {
-                        updateItem(id, {
-                            status: 'waiting',
-                            waitingReason: `Rate limited — retrying in ${sec}s (try ${attempt}/${max})`,
-                        });
-                    };
-                    const proposal = await callGemini(key, payload, idx, file.name, onRateLimitWait);
-                    // In case we just finished a rate-limit wait, flip back to processing briefly
-                    updateItem(id, { status: 'processing', waitingReason: null });
+                    const docText = payload.kind === 'text' ? payload.text : '';
+
+                    let proposal;
+
+                    if (key) {
+                        // Try Gemini first
+                        const onRateLimitWait = (sec, attempt, max) => {
+                            updateItem(id, {
+                                status: 'waiting',
+                                waitingReason: `Rate limited — retrying in ${sec}s (try ${attempt}/${max})`,
+                            });
+                        };
+                        try {
+                            proposal = await callGemini(key, payload, idx, file.name, onRateLimitWait);
+                            updateItem(id, { status: 'processing', waitingReason: null });
+                        } catch (e) {
+                            console.warn('[Bos Page] Gemini failed, falling back to local pattern match:', e.message);
+                            proposal = proposeLocally(idx.folders, docText, file.name);
+                            proposal.reasoning = `Gemini unavailable (${e.message.slice(0, 80)}). Used local match. ${proposal.reasoning}`;
+                        }
+                    } else {
+                        // No API key — use local pattern matching directly
+                        proposal = proposeLocally(idx.folders, docText, file.name);
+                    }
+
                     const folder = idx.folders.find(f => f.path === proposal.folder_path);
                     updateItem(id, {
                         status: 'ready',
@@ -869,12 +1000,7 @@ Respond with STRICT JSON ONLY matching this schema:
                         },
                     });
                 } catch (e) {
-                    // Friendlier message for rate-limit errors
-                    let msg = e.message || String(e);
-                    if (msg.includes('429') || /quota|rate/i.test(msg)) {
-                        msg = 'Rate limited by Gemini (free tier allows 15 req/min). Wait a minute and retry.';
-                    }
-                    updateItem(id, { status: 'error', error: msg });
+                    updateItem(id, { status: 'error', error: e.message || String(e) });
                 }
             };
 
@@ -1018,8 +1144,8 @@ Respond with STRICT JSON ONLY matching this schema:
                     )}
 
                     {!apiKey && items.length === 0 && (
-                        <div className="mt-8 text-center text-sm text-amber-700 bg-amber-50 border border-amber-100 rounded-xl p-4">
-                            Add a Gemini API key in Settings to start filing.
+                        <div className="mt-8 text-center text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                            Running in pattern-match mode. Add a Gemini key in Settings for AI-assisted naming (optional).
                         </div>
                     )}
                 </div>
