@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v0.4-apr22 gis-only';
+        const APP_VERSION = 'v0.5-apr22 dedup+queue';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -640,7 +640,7 @@ Respond with STRICT JSON ONLY matching this schema:
         // Represents one file in various states (processing, proposing, filing, done).
         // ============================================================
         const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip }) => {
-            const { status, originalName, proposal, edits, error, webViewLink } = item;
+            const { status, originalName, proposal, edits, error, webViewLink, waitingReason } = item;
             const folderOptions = useMemo(
                 () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
                 [folderIndex]
@@ -665,6 +665,16 @@ Respond with STRICT JSON ONLY matching this schema:
                     {status === 'processing' && (
                         <div className="flex items-center gap-2 text-sm text-slate-500">
                             <Spinner size={14} /> Analyzing document…
+                        </div>
+                    )}
+
+                    {status === 'waiting' && (
+                        <div className="flex items-center justify-between gap-2 text-sm text-amber-700 bg-amber-50 border border-amber-100 rounded-lg p-3">
+                            <div className="flex items-center gap-2">
+                                <Spinner size={14} />
+                                <span>{waitingReason || 'Queued…'}</span>
+                            </div>
+                            <button onClick={() => onSkip(item.id)} className="text-xs underline">Cancel</button>
                         </div>
                     )}
 
@@ -747,23 +757,47 @@ Respond with STRICT JSON ONLY matching this schema:
                 setItems(prev => prev.map(it => it.id === id ? { ...it, ...patch } : it));
             };
 
+            // Refs so async processFile can see the latest values without stale closure
+            const apiKeyRef = useRef(apiKey);
+            const folderIndexRef = useRef(folderIndex);
+            useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
+            useEffect(() => { folderIndexRef.current = folderIndex; }, [folderIndex]);
+
+            // Wait for folder index + api key to be ready. Polls every 500ms.
+            const waitForPrereqs = async (id) => {
+                while (true) {
+                    const key = apiKeyRef.current;
+                    const idx = folderIndexRef.current;
+                    if (key && idx && idx.folders?.length) return { key, idx };
+                    // Update waiting reason so the card shows what's missing
+                    const reason = !key ? 'Waiting for Gemini API key (Settings)…'
+                                 : !idx ? 'Waiting for folder index to start…'
+                                 : 'Waiting for folder indexing to finish…';
+                    updateItem(id, { status: 'waiting', error: null, waitingReason: reason });
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            };
+
             const processFile = async (file) => {
                 const id = Math.random().toString(36).slice(2);
                 setItems(prev => [...prev, {
-                    id, file, originalName: file.name, status: 'processing',
+                    id, file, originalName: file.name, status: 'waiting',
                     proposal: null, edits: { folderId: '', filename: '' }, error: null, webViewLink: null,
+                    waitingReason: 'Queued…',
                 }]);
                 try {
+                    const { key, idx } = await waitForPrereqs(id);
+                    updateItem(id, { status: 'processing', waitingReason: null });
                     const payload = await prepareFileForNaming(file);
-                    const proposal = await callGemini(apiKey, payload, folderIndex, file.name);
+                    const proposal = await callGemini(key, payload, idx, file.name);
 
                     // Map folder_path back to folder id
-                    const folder = folderIndex.folders.find(f => f.path === proposal.folder_path);
+                    const folder = idx.folders.find(f => f.path === proposal.folder_path);
                     updateItem(id, {
                         status: 'ready',
                         proposal,
                         edits: {
-                            folderId: folder?.id || folderIndex.folders[0]?.id || '',
+                            folderId: folder?.id || idx.folders[0]?.id || '',
                             filename: proposal.filename || file.name,
                         },
                     });
@@ -775,14 +809,7 @@ Respond with STRICT JSON ONLY matching this schema:
             const onFilesSelected = (fileList) => {
                 const files = Array.from(fileList);
                 if (!files.length) return;
-                if (!apiKey) {
-                    alert('Add a Gemini API key in Settings first.');
-                    return;
-                }
-                if (!folderIndex) {
-                    alert('Folder index is still loading. Try again in a moment.');
-                    return;
-                }
+                // No more alerts — just queue. Cards show why they're waiting.
                 files.forEach(processFile);
             };
 
@@ -1232,6 +1259,7 @@ Respond with STRICT JSON ONLY matching this schema:
                 const MAX_EXAMPLES_PER_FOLDER = 40;
                 const FOLDER_MIME = 'application/vnd.google-apps.folder';
                 const folders = []; // { id, name, path, rootId, files: [names] }
+                const visited = new Set(); // folder IDs we've already walked — prevents duplicate walks
                 let folderCount = 0;
                 let fileCount = 0;
 
@@ -1252,9 +1280,12 @@ Respond with STRICT JSON ONLY matching this schema:
                 // BFS from a root folder
                 const walkRoot = async (rootId) => {
                     const rootMeta = await drive.getMeta(token, rootId);
+                    if (visited.has(rootMeta.id)) return; // skip if already walked as part of another root
                     const queue = [{ id: rootMeta.id, name: rootMeta.name, path: rootMeta.name, rootId: rootMeta.id }];
                     while (queue.length) {
                         const cur = queue.shift();
+                        if (visited.has(cur.id)) continue; // dedup: folder might be shared across multiple parents
+                        visited.add(cur.id);
                         let children;
                         try {
                             children = await getAllChildren(cur.id);
@@ -1265,12 +1296,14 @@ Respond with STRICT JSON ONLY matching this schema:
                         const fileNames = [];
                         for (const c of children) {
                             if (c.mimeType === FOLDER_MIME) {
-                                queue.push({
-                                    id: c.id,
-                                    name: c.name,
-                                    path: `${cur.path} / ${c.name}`,
-                                    rootId: cur.rootId,
-                                });
+                                if (!visited.has(c.id)) {
+                                    queue.push({
+                                        id: c.id,
+                                        name: c.name,
+                                        path: `${cur.path} / ${c.name}`,
+                                        rootId: cur.rootId,
+                                    });
+                                }
                             } else {
                                 fileNames.push(c.name);
                                 fileCount++;
