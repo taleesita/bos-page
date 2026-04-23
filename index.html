@@ -14,8 +14,6 @@
     <meta name="apple-mobile-web-app-title" content="Bos Page">
     <meta name="theme-color" content="#ffffff">
 
-    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -63,22 +61,11 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v0.3-apr22 gis';
+        const APP_VERSION = 'v0.4-apr22 gis-only';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
         const GOOGLE_CLIENT_ID = '388095163990-bs2mtkv57v3htag3c1n3l1kd0mool42n.apps.googleusercontent.com';
-
-        const FB_CONFIG = {
-            apiKey: "AIzaSyByX1smy6AXwocShBRhqj29cnOW4q3BWLw",
-            authDomain: "bo-s-page.firebaseapp.com",
-            projectId: "bo-s-page",
-            storageBucket: "bo-s-page.firebasestorage.app",
-            messagingSenderId: "388095163990",
-            appId: "1:388095163990:web:9363400eea2595cf9e05f7"
-        };
-        firebase.initializeApp(FB_CONFIG);
-        const fbAuth = firebase.auth();
 
         const ALLOWED_EMAILS = ['taly.matiteyahu@gmail.com', 'doug.pickard@gmail.com'];
         const EMAIL_TO_NAME = {
@@ -133,6 +120,8 @@
             folderIndex: 'bospage_folder_index',
             folderIndexTs: 'bospage_folder_index_ts',
             activeTab: 'bospage_active_tab',
+            userEmail: 'bospage_user_email',
+            userName: 'bospage_user_name',
         };
 
         // ============================================================
@@ -385,14 +374,10 @@ Respond with STRICT JSON ONLY matching this schema:
         };
 
         // ============================================================
-        // AUTH — Firebase (identity) + Google Identity Services (Drive token)
+        // AUTH — Google Identity Services (GIS) only, no Firebase
         // ============================================================
-        // Firebase Google Auth's signInWithPopup doesn't reliably return a Drive-scoped
-        // access token when user is already signed in — it skips the OAuth dance and
-        // credentialFromResult returns null. So we use Firebase for identity only
-        // (email, session persistence) and GIS TokenClient for the access token.
-
-        const firebaseProvider = new firebase.auth.GoogleAuthProvider();
+        // One popup per user click. GIS handles OAuth; we call Google's userinfo
+        // endpoint with the access token to get the email, then check the allowlist.
 
         // Wait for the GIS script (loaded async) to be ready
         const waitForGIS = () => new Promise((resolve, reject) => {
@@ -458,78 +443,86 @@ Respond with STRICT JSON ONLY matching this schema:
             });
         };
 
+        // Fetch user email/name from Google using the access token
+        const fetchUserInfo = async (accessToken) => {
+            const resp = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: `Bearer ${accessToken}` },
+            });
+            if (!resp.ok) throw new Error(`userinfo failed: ${resp.status}`);
+            return resp.json();
+        };
+
         const useAuth = () => {
-            const [user, setUser] = useState(null);
-            const [token, setToken] = useState(null);
-            const [loading, setLoading] = useState(true);
+            // Hydrate from localStorage so a page refresh doesn't require re-signing in.
+            const [user, setUser] = useState(() => {
+                const email = storage.get(STORAGE_KEYS.userEmail);
+                const name = storage.get(STORAGE_KEYS.userName);
+                if (email && ALLOWED_EMAILS.includes(email)) {
+                    return { email, displayName: name || email };
+                }
+                return null;
+            });
+            const [token, setToken] = useState(() => {
+                const t = storage.get(STORAGE_KEYS.accessToken);
+                const expiry = parseInt(storage.get(STORAGE_KEYS.accessTokenExpiry, '0'), 10);
+                return (t && expiry > Date.now()) ? t : null;
+            });
+            const [loading, setLoading] = useState(false);
             const [error, setError] = useState(null);
 
-            useEffect(() => {
-                // Restore cached access token if still valid
-                const stored = storage.get(STORAGE_KEYS.accessToken);
-                const expiry = parseInt(storage.get(STORAGE_KEYS.accessTokenExpiry, '0'), 10);
-                if (stored && expiry > Date.now()) setToken(stored);
-
-                const unsub = fbAuth.onAuthStateChanged(u => {
-                    if (u && ALLOWED_EMAILS.includes(u.email)) {
-                        setUser(u);
-                    } else if (u) {
-                        setError(`${u.email} is not authorized for this app.`);
-                        fbAuth.signOut();
-                        setUser(null);
-                    } else {
-                        setUser(null);
-                    }
-                    setLoading(false);
-                });
-                return unsub;
-            }, []);
-
             const persistToken = (accessToken, expiresInSec) => {
-                const expiry = Date.now() + Math.max(60, (expiresInSec || 3600) - 300) * 1000; // refresh 5m early
+                const expiry = Date.now() + Math.max(60, (expiresInSec || 3600) - 300) * 1000;
                 setToken(accessToken);
                 storage.set(STORAGE_KEYS.accessToken, accessToken);
                 storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
             };
 
+            const persistUser = (email, name) => {
+                const u = { email, displayName: name || email };
+                setUser(u);
+                storage.set(STORAGE_KEYS.userEmail, email);
+                storage.set(STORAGE_KEYS.userName, u.displayName);
+            };
+
             const signIn = useCallback(async () => {
                 setError(null);
+                setLoading(true);
                 try {
-                    // Step 1: Firebase sign-in for identity (email, allowlist, session).
-                    const result = await fbAuth.signInWithPopup(firebaseProvider);
-                    const email = result.user?.email;
-                    // Allowlist re-check here too (onAuthStateChanged also does it)
-                    if (!ALLOWED_EMAILS.includes(email)) {
-                        throw new Error(`${email} is not authorized.`);
+                    // One popup: GIS gets consent + issues the access token
+                    const resp = await requestAccessToken(''); // no login hint — let user pick
+                    const info = await fetchUserInfo(resp.access_token);
+                    if (!ALLOWED_EMAILS.includes(info.email)) {
+                        // Revoke so we don't leak access
+                        try { google.accounts.oauth2.revoke(resp.access_token, () => {}); } catch {}
+                        throw new Error(`${info.email} is not authorized for this app.`);
                     }
-                    // Step 2: GIS for Drive access token.
-                    const resp = await requestAccessToken('', email);
+                    persistUser(info.email, info.name);
                     persistToken(resp.access_token, resp.expires_in);
                 } catch (e) {
                     console.error('signIn failed:', e);
                     setError(e.message || 'Sign-in failed');
+                } finally {
+                    setLoading(false);
                 }
             }, []);
 
             const signOut = useCallback(async () => {
-                // Revoke the current token so the next sign-in gets a fresh scope grant.
                 const current = storage.get(STORAGE_KEYS.accessToken);
                 if (current && window.google?.accounts?.oauth2) {
                     try { google.accounts.oauth2.revoke(current, () => {}); } catch {}
                 }
-                storage.del(STORAGE_KEYS.accessToken);
-                storage.del(STORAGE_KEYS.accessTokenExpiry);
-                storage.del(STORAGE_KEYS.folderIndex);
-                storage.del(STORAGE_KEYS.folderIndexTs);
+                [STORAGE_KEYS.accessToken, STORAGE_KEYS.accessTokenExpiry,
+                 STORAGE_KEYS.folderIndex, STORAGE_KEYS.folderIndexTs,
+                 STORAGE_KEYS.userEmail, STORAGE_KEYS.userName].forEach(k => storage.del(k));
                 setToken(null);
-                await fbAuth.signOut();
+                setUser(null);
             }, []);
 
-            // Re-request Drive token — silent if consent cached, else prompts.
+            // Re-request Drive token (silent if possible)
             const refreshToken = useCallback(async () => {
                 setError(null);
                 try {
-                    const email = fbAuth.currentUser?.email;
+                    const email = user?.email;
                     try {
                         const resp = await requestAccessToken('', email);
                         persistToken(resp.access_token, resp.expires_in);
@@ -545,7 +538,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     setError('Could not get Drive access: ' + (e.message || e));
                 }
                 return null;
-            }, []);
+            }, [user]);
 
             return { user, token, loading, error, signIn, signOut, refreshToken };
         };
