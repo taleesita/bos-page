@@ -16,6 +16,7 @@
 
     <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -62,7 +63,11 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v0.2-apr22 auth-fix';
+        const APP_VERSION = 'v0.3-apr22 gis';
+
+        // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
+        // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
+        const GOOGLE_CLIENT_ID = '388095163990-bs2mtkv57v3htag3c1n3l1kd0mool42n.apps.googleusercontent.com';
 
         const FB_CONFIG = {
             apiKey: "AIzaSyByX1smy6AXwocShBRhqj29cnOW4q3BWLw",
@@ -380,23 +385,77 @@ Respond with STRICT JSON ONLY matching this schema:
         };
 
         // ============================================================
-        // AUTH — Firebase Google sign-in + Drive scope
+        // AUTH — Firebase (identity) + Google Identity Services (Drive token)
         // ============================================================
-        // Build a provider fresh each call — Firebase sometimes caches state
-        // on a reused provider and returns UserCredential with null credential.
-        const makeProvider = (prompt = 'select_account') => {
-            const p = new firebase.auth.GoogleAuthProvider();
-            GOOGLE_SCOPES.forEach(s => p.addScope(s));
-            p.setCustomParameters({ prompt });
-            return p;
+        // Firebase Google Auth's signInWithPopup doesn't reliably return a Drive-scoped
+        // access token when user is already signed in — it skips the OAuth dance and
+        // credentialFromResult returns null. So we use Firebase for identity only
+        // (email, session persistence) and GIS TokenClient for the access token.
+
+        const firebaseProvider = new firebase.auth.GoogleAuthProvider();
+
+        // Wait for the GIS script (loaded async) to be ready
+        const waitForGIS = () => new Promise((resolve, reject) => {
+            if (window.google?.accounts?.oauth2) return resolve();
+            const start = Date.now();
+            const iv = setInterval(() => {
+                if (window.google?.accounts?.oauth2) {
+                    clearInterval(iv);
+                    resolve();
+                } else if (Date.now() - start > 10000) {
+                    clearInterval(iv);
+                    reject(new Error('Google Identity Services did not load within 10s — check your network / adblocker.'));
+                }
+            }, 50);
+        });
+
+        // Singleton token client. Callback is swapped per-request via the resolver ref below.
+        let _tokenClient = null;
+        let _pendingResolver = null;
+
+        const getTokenClient = () => {
+            if (_tokenClient) return _tokenClient;
+            _tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GOOGLE_CLIENT_ID,
+                scope: GOOGLE_SCOPES.join(' '),
+                callback: (response) => {
+                    if (_pendingResolver) {
+                        _pendingResolver(response);
+                        _pendingResolver = null;
+                    }
+                },
+                error_callback: (err) => {
+                    if (_pendingResolver) {
+                        _pendingResolver({ error: err.type || 'token_error', error_description: err.message || String(err) });
+                        _pendingResolver = null;
+                    }
+                },
+            });
+            return _tokenClient;
         };
 
-        // Extract accessToken from a UserCredential result; throws if missing.
-        const extractAccessToken = (result) => {
-            const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-            if (credential && credential.accessToken) return credential.accessToken;
-            console.error('No credential on result:', result);
-            throw new Error('Google did not return an access token. Try Sign out → sign in again.');
+        // Request a fresh access token. prompt='' = silent if consent cached, else popup.
+        // prompt='consent' = always show consent screen. loginHint = email to prefill.
+        const requestAccessToken = async (prompt = '', loginHint) => {
+            await waitForGIS();
+            return new Promise((resolve, reject) => {
+                const client = getTokenClient();
+                _pendingResolver = (response) => {
+                    if (response.error) {
+                        reject(new Error(response.error_description || response.error));
+                    } else {
+                        resolve(response);
+                    }
+                };
+                const params = { prompt };
+                if (loginHint) params.hint = loginHint;
+                try {
+                    client.requestAccessToken(params);
+                } catch (e) {
+                    _pendingResolver = null;
+                    reject(e);
+                }
+            });
         };
 
         const useAuth = () => {
@@ -406,7 +465,7 @@ Respond with STRICT JSON ONLY matching this schema:
             const [error, setError] = useState(null);
 
             useEffect(() => {
-                // Restore token from storage if still valid
+                // Restore cached access token if still valid
                 const stored = storage.get(STORAGE_KEYS.accessToken);
                 const expiry = parseInt(storage.get(STORAGE_KEYS.accessTokenExpiry, '0'), 10);
                 if (stored && expiry > Date.now()) setToken(stored);
@@ -426,8 +485,8 @@ Respond with STRICT JSON ONLY matching this schema:
                 return unsub;
             }, []);
 
-            const persistToken = (accessToken) => {
-                const expiry = Date.now() + 55 * 60 * 1000; // tokens last 1h, refresh at 55m
+            const persistToken = (accessToken, expiresInSec) => {
+                const expiry = Date.now() + Math.max(60, (expiresInSec || 3600) - 300) * 1000; // refresh 5m early
                 setToken(accessToken);
                 storage.set(STORAGE_KEYS.accessToken, accessToken);
                 storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
@@ -436,8 +495,16 @@ Respond with STRICT JSON ONLY matching this schema:
             const signIn = useCallback(async () => {
                 setError(null);
                 try {
-                    const result = await fbAuth.signInWithPopup(makeProvider('select_account'));
-                    persistToken(extractAccessToken(result));
+                    // Step 1: Firebase sign-in for identity (email, allowlist, session).
+                    const result = await fbAuth.signInWithPopup(firebaseProvider);
+                    const email = result.user?.email;
+                    // Allowlist re-check here too (onAuthStateChanged also does it)
+                    if (!ALLOWED_EMAILS.includes(email)) {
+                        throw new Error(`${email} is not authorized.`);
+                    }
+                    // Step 2: GIS for Drive access token.
+                    const resp = await requestAccessToken('', email);
+                    persistToken(resp.access_token, resp.expires_in);
                 } catch (e) {
                     console.error('signIn failed:', e);
                     setError(e.message || 'Sign-in failed');
@@ -445,6 +512,11 @@ Respond with STRICT JSON ONLY matching this schema:
             }, []);
 
             const signOut = useCallback(async () => {
+                // Revoke the current token so the next sign-in gets a fresh scope grant.
+                const current = storage.get(STORAGE_KEYS.accessToken);
+                if (current && window.google?.accounts?.oauth2) {
+                    try { google.accounts.oauth2.revoke(current, () => {}); } catch {}
+                }
                 storage.del(STORAGE_KEYS.accessToken);
                 storage.del(STORAGE_KEYS.accessTokenExpiry);
                 storage.del(STORAGE_KEYS.folderIndex);
@@ -453,23 +525,21 @@ Respond with STRICT JSON ONLY matching this schema:
                 await fbAuth.signOut();
             }, []);
 
-            // Re-request Drive token if missing/expired.
-            // If user is already signed in, use reauthenticateWithPopup with prompt=consent —
-            // this reliably returns a fresh credential with accessToken, whereas signInWithPopup
-            // can return a UserCredential with null credential when the user is already signed in.
+            // Re-request Drive token — silent if consent cached, else prompts.
             const refreshToken = useCallback(async () => {
                 setError(null);
                 try {
-                    const currentUser = fbAuth.currentUser;
-                    let result;
-                    if (currentUser) {
-                        result = await currentUser.reauthenticateWithPopup(makeProvider('consent'));
-                    } else {
-                        result = await fbAuth.signInWithPopup(makeProvider('consent'));
+                    const email = fbAuth.currentUser?.email;
+                    try {
+                        const resp = await requestAccessToken('', email);
+                        persistToken(resp.access_token, resp.expires_in);
+                        return resp.access_token;
+                    } catch (silentErr) {
+                        console.log('Silent token request failed, showing consent:', silentErr.message);
+                        const resp = await requestAccessToken('consent', email);
+                        persistToken(resp.access_token, resp.expires_in);
+                        return resp.access_token;
                     }
-                    const accessToken = extractAccessToken(result);
-                    persistToken(accessToken);
-                    return accessToken;
                 } catch (e) {
                     console.error('refreshToken failed:', e);
                     setError('Could not get Drive access: ' + (e.message || e));
