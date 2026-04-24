@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v2.2-apr23 fail-fast-gemini';
+        const APP_VERSION = 'v2.3-apr23 preview+no-guess';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -237,6 +237,23 @@
             return text.trim();
         };
 
+        // Generate a thumbnail preview for a file — data URL for images or PDF page 1.
+        // Returns null if no preview can be made.
+        const generatePreview = async (file) => {
+            try {
+                const type = file.type || '';
+                if (type.startsWith('image/')) {
+                    return await fileUtils.readAsDataURL(file);
+                }
+                if (type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+                    return await pdfFirstPageToDataUrl(file);
+                }
+            } catch (e) {
+                console.warn('Preview generation failed:', e);
+            }
+            return null;
+        };
+
         // Render PDF page 1 to a data URL for vision fallback
         const pdfFirstPageToDataUrl = async (file) => {
             if (!window.pdfjsLib) return null;
@@ -359,14 +376,36 @@
         // Local (no-LLM) proposer: rank folders by keyword overlap, adapt filename pattern
         // from the folder's most recent existing filename by swapping in the doc's date.
         const proposeLocally = (folders, docText, originalFilename) => {
-            const ranked = rankFoldersByRelevance(folders, docText, 3);
-            const topFolder = ranked[0];
+            // Compute top folder + its actual score so we know whether to trust the match
+            const tokenize = (s) => (s || '').toLowerCase().match(/[a-z0-9]{3,}/g) || [];
+            const docTokens = new Set(tokenize(docText));
+            let topFolder = null;
+            let topScore = 0;
+            for (const f of folders) {
+                if (!f.files?.length) continue;
+                let s = 0;
+                for (const t of tokenize(f.path)) if (docTokens.has(t)) s += 3;
+                for (const name of f.files) {
+                    for (const t of tokenize(name)) if (docTokens.has(t)) s += 1;
+                }
+                if (s > topScore) { topScore = s; topFolder = f; }
+            }
 
             const ext = (originalFilename.match(/\.[a-z0-9]+$/i) || [''])[0];
             const baseOriginal = originalFilename.replace(/\.[a-z0-9]+$/i, '');
             const docDate = extractDocDate(docText);
             let filename = originalFilename;
             let reasoning;
+
+            // No keyword match at all — don't guess the folder, let the user pick
+            if (topScore === 0) {
+                return {
+                    folder_path: '',
+                    filename: originalFilename,
+                    confidence: 0.1,
+                    reasoning: 'No keyword overlap between document and any folder. Please pick folder and filename manually.',
+                };
+            }
 
             if (topFolder?.files?.length) {
                 // Use the most recent filename in that folder as a template
@@ -397,10 +436,15 @@
                     }
                 }
 
-                filename = adapted + (exampleExt || ext);
-                reasoning = note
-                    ? `Matched "${topFolder.name}"; ${note}.`
-                    : `Matched "${topFolder.name}" by keyword. Couldn't auto-adapt filename — please edit.`;
+                if (note) {
+                    // We successfully adapted the template
+                    filename = adapted + (exampleExt || ext);
+                    reasoning = `Matched "${topFolder.name}"; ${note}.`;
+                } else {
+                    // Couldn't adapt — keep the original filename instead of reusing the example verbatim
+                    filename = originalFilename;
+                    reasoning = `Matched "${topFolder.name}" by keyword. Couldn't auto-adapt filename — kept original. Example in folder: "${example}".`;
+                }
             } else if (topFolder) {
                 // Folder has no examples — fall back to docdate + original base
                 if (docDate) {
@@ -816,7 +860,8 @@ Respond with STRICT JSON ONLY matching this schema:
         // Represents one file in various states (processing, proposing, filing, done).
         // ============================================================
         const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip, onRetry }) => {
-            const { status, originalName, proposal, edits, error, webViewLink, waitingReason } = item;
+            const { status, originalName, proposal, edits, error, webViewLink, waitingReason, previewUrl } = item;
+            const [previewOpen, setPreviewOpen] = useState(false);
             const folderOptions = useMemo(
                 () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
                 [folderIndex]
@@ -826,7 +871,16 @@ Respond with STRICT JSON ONLY matching this schema:
 
             return (
                 <div className="bg-white rounded-2xl border border-slate-200 p-4 fade-in">
-                    <div className="flex items-start justify-between gap-3 mb-3">
+                    <div className="flex items-start gap-3 mb-3">
+                        {previewUrl && (
+                            <button
+                                onClick={() => setPreviewOpen(true)}
+                                className="shrink-0 w-16 h-20 bg-slate-100 rounded-lg overflow-hidden border border-slate-200 hover:border-slate-400 transition"
+                                title="Click to enlarge"
+                            >
+                                <img src={previewUrl} alt="preview" className="w-full h-full object-cover" />
+                            </button>
+                        )}
                         <div className="min-w-0 flex-1">
                             <div className="text-xs text-slate-400 mb-1">Original</div>
                             <div className="text-sm font-medium text-slate-700 truncate">{originalName}</div>
@@ -837,6 +891,14 @@ Respond with STRICT JSON ONLY matching this schema:
                             </span>
                         )}
                     </div>
+                    {previewOpen && previewUrl && (
+                        <div
+                            className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6 cursor-zoom-out"
+                            onClick={() => setPreviewOpen(false)}
+                        >
+                            <img src={previewUrl} alt="preview" className="max-w-full max-h-full rounded-lg shadow-2xl" />
+                        </div>
+                    )}
 
                     {status === 'processing' && (
                         <div className="flex items-center gap-2 text-sm text-slate-500">
@@ -1012,7 +1074,12 @@ Respond with STRICT JSON ONLY matching this schema:
                     id, file, originalName: file.name, status: 'waiting',
                     proposal: null, edits: { folderId: '', filename: '' }, error: null, webViewLink: null,
                     waitingReason: 'Queued…',
+                    previewUrl: null,
                 }]);
+                // Generate preview async (non-blocking)
+                generatePreview(file).then(url => {
+                    if (url) updateItem(id, { previewUrl: url });
+                }).catch(() => {});
                 // Chain onto the queue so calls run sequentially
                 geminiQueueRef.current = geminiQueueRef.current.then(async () => {
                     await runGeminiForItem(id, file);
