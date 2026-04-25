@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v2.4-apr23 cascading+bigprev';
+        const APP_VERSION = 'v2.7-apr23 taly-categories';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -237,21 +237,45 @@
             return text.trim();
         };
 
-        // Generate a thumbnail preview for a file — data URL for images or PDF page 1.
-        // Returns null if no preview can be made.
-        const generatePreview = async (file) => {
+        // Render all pages of a PDF to data URLs (capped), calling onProgress with
+        // the array so far after each page — lets the UI update progressively.
+        const pdfAllPagesToDataUrls = async (file, maxPages, onProgress) => {
+            if (!window.pdfjsLib) return [];
+            const buf = await fileUtils.readAsArrayBuffer(file);
+            const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+            const count = Math.min(pdf.numPages, maxPages || 20);
+            const urls = [];
+            for (let i = 1; i <= count; i++) {
+                const page = await pdf.getPage(i);
+                const viewport = page.getViewport({ scale: 1.5 });
+                const canvas = document.createElement('canvas');
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                urls.push(canvas.toDataURL('image/jpeg', 0.75));
+                if (onProgress) onProgress(urls.slice());
+            }
+            return urls;
+        };
+
+        // Generate preview pages for a file. Returns array of data URLs (1 for images, N for PDFs).
+        // Calls onProgress incrementally as PDF pages render so the first page shows fast.
+        const generatePreviews = async (file, onProgress) => {
             try {
                 const type = file.type || '';
                 if (type.startsWith('image/')) {
-                    return await fileUtils.readAsDataURL(file);
+                    const url = await fileUtils.readAsDataURL(file);
+                    const all = [url];
+                    if (onProgress) onProgress(all);
+                    return all;
                 }
                 if (type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
-                    return await pdfFirstPageToDataUrl(file);
+                    return await pdfAllPagesToDataUrls(file, 20, onProgress);
                 }
             } catch (e) {
                 console.warn('Preview generation failed:', e);
             }
-            return null;
+            return [];
         };
 
         // Render PDF page 1 to a data URL for vision fallback
@@ -320,6 +344,72 @@
             return lines.join('\n');
         };
 
+        // Semantic categories: help the ranker understand that a document ABOUT baby items
+        // belongs in a folder NAMED "Nutbear", even though those words never overlap directly.
+        //
+        // docKeywords = words that appear in the document (expanded matching)
+        // folderKeywords = words in the folder PATH that indicate this is the destination
+        //
+        // Adjust / extend these as patterns emerge.
+        const SEMANTIC_CATEGORIES = [
+            {
+                name: 'baby',
+                docKeywords: ['baby','infant','toddler','newborn','nursery','crib','pacifier','formula','diaper','stroller','teething','breast pump','bottle warmer','swaddle','bassinet','highchair','onesie','carseat','car seat','pram','bib','sippy','breastmilk'],
+                folderKeywords: ['nutbear','baby','kids','infant','children','nursery'],
+            },
+            {
+                name: 'kitchen',
+                docKeywords: ['blender','toaster','microwave','oven','cooktop','mixer','kitchenware','cookware','spatula','dishwasher','instant pot','sous vide','espresso','coffee maker','kettle','cast iron','nonstick','cutlery','knife set','food processor','saucepan','cutting board'],
+                folderKeywords: ['kitchenware','kitchen','cookware'],
+            },
+            {
+                name: 'furniture_housewares',
+                docKeywords: ['vacuum cleaner','mattress','pillow','bedding','sheet','comforter','curtain','iron','humidifier','air purifier','fan','heater','lamp','lightbulb','vac seal','vacuum sealer','sofa','chair','table','desk','shelf','shelving','ottoman','nightstand','dresser','bookshelf','bed frame','rug','decor'],
+                folderKeywords: ['furniture','housewares','home goods','household','bedroom','living'],
+            },
+            {
+                name: 'outdoor_plants',
+                docKeywords: ['camping','hiking','tent','sleeping bag','backpack','waterproof','fishing','kayak','ski','snowboard','garden','plant','planter','pot','hose','lawn','outdoor light','patio','grill','bbq','mower','leaf blower','outdoor storage'],
+                folderKeywords: ['outdoor','plants','patio','garden'],
+            },
+            {
+                name: 'gopro',
+                docKeywords: ['gopro','go pro','action cam','action camera','dji osmo','dji action','insta360','helmet cam','floating hand grip','quick release mount'],
+                folderKeywords: ['gopro','go pro','action cam'],
+            },
+            {
+                name: 'electronics',
+                docKeywords: ['charger','battery','headphone','earbud','speaker','router','modem','wifi','bluetooth','hdmi','usb','laptop','monitor','keyboard','mouse','smart home','thermostat','soundbar','tv stand'],
+                folderKeywords: ['electronics','tech','gadget','audio','computer'],
+            },
+            {
+                name: 'pet_dog',
+                docKeywords: ['dog','puppy','canine','leash','collar','kennel','chew toy','harness','dog carrier','dog crate','dog food','dog treat'],
+                folderKeywords: ['dog stuff','dog','canine'],
+            },
+            {
+                name: 'pet_other',
+                docKeywords: ['cat','feline','litter','aquarium','veterinary','vet visit','kitten'],
+                folderKeywords: ['pet','cat','vet'],
+            },
+            {
+                name: 'health',
+                docKeywords: ['prescription','pharmacy','diagnosis','clinic','patient','dosage','medication','thermometer','blood pressure','medical'],
+                folderKeywords: ['health','medical','pharmacy'],
+            },
+        ];
+
+        // Detect which semantic categories a document falls into, based on substring
+        // match of docKeywords in the raw text (not just tokenized words, so multi-word
+        // terms like "vacuum seal" match).
+        const detectCategories = (docText) => {
+            if (!docText) return [];
+            const lower = docText.toLowerCase();
+            return SEMANTIC_CATEGORIES.filter(cat =>
+                cat.docKeywords.some(kw => lower.includes(kw))
+            );
+        };
+
         // Extract a likely document date from extracted text. Returns {year, month, day} or null.
         const extractDocDate = (text) => {
             if (!text) return null;
@@ -379,6 +469,22 @@
             // Compute top folder + its actual score so we know whether to trust the match
             const tokenize = (s) => (s || '').toLowerCase().match(/[a-z0-9]{3,}/g) || [];
             const docTokens = new Set(tokenize(docText));
+            const docLower = (docText || '').toLowerCase();
+
+            // Detect semantic categories in the doc — e.g. "baby stuff", "kitchen appliance"
+            const categories = detectCategories(docText);
+            const categoryBonusFor = (path) => {
+                if (!categories.length) return 0;
+                const pLower = path.toLowerCase();
+                let bonus = 0;
+                for (const cat of categories) {
+                    if (cat.folderKeywords.some(fk => pLower.includes(fk.toLowerCase()))) {
+                        bonus += 20; // strong weight — semantic category alignment
+                    }
+                }
+                return bonus;
+            };
+
             let topFolder = null;
             let topScore = 0;
             for (const f of folders) {
@@ -388,6 +494,7 @@
                 for (const name of f.files) {
                     for (const t of tokenize(name)) if (docTokens.has(t)) s += 1;
                 }
+                s += categoryBonusFor(f.path);
                 if (s > topScore) { topScore = s; topFolder = f; }
             }
 
@@ -483,6 +590,16 @@
         const rankFoldersByRelevance = (folders, docText, topN = 150) => {
             const tokenize = (s) => (s || '').toLowerCase().match(/[a-z0-9]{3,}/g) || [];
             const docTokens = new Set(tokenize(docText));
+            const categories = detectCategories(docText);
+            const categoryBonusFor = (path) => {
+                if (!categories.length) return 0;
+                const pLower = path.toLowerCase();
+                let bonus = 0;
+                for (const cat of categories) {
+                    if (cat.folderKeywords.some(fk => pLower.includes(fk.toLowerCase()))) bonus += 20;
+                }
+                return bonus;
+            };
             const scored = folders
                 .filter(f => f.files?.length)
                 .map(f => {
@@ -491,6 +608,7 @@
                     for (const name of f.files) {
                         for (const t of tokenize(name)) if (docTokens.has(t)) score += 1;
                     }
+                    score += categoryBonusFor(f.path);
                     return { f, score };
                 });
             // Primary: relevance score. Tiebreaker: folders with more example files (more active).
@@ -961,8 +1079,14 @@ Respond with STRICT JSON ONLY matching this schema:
         // Represents one file in various states (processing, proposing, filing, done).
         // ============================================================
         const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip, onRetry }) => {
-            const { status, originalName, proposal, edits, error, webViewLink, waitingReason, previewUrl } = item;
+            const { status, originalName, proposal, edits, error, webViewLink, waitingReason, previewUrls } = item;
+            const pages = previewUrls || [];
+            const pageCount = pages.length;
             const [previewOpen, setPreviewOpen] = useState(false);
+            const [pageIdx, setPageIdx] = useState(0);
+            // Clamp pageIdx if page count shrinks (shouldn't, but safe)
+            useEffect(() => { if (pageIdx >= pageCount && pageCount > 0) setPageIdx(0); }, [pageCount]);
+            const currentPage = pages[pageIdx] || pages[0] || null;
             const folderOptions = useMemo(
                 () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
                 [folderIndex]
@@ -977,14 +1101,36 @@ Respond with STRICT JSON ONLY matching this schema:
 
             return (
                 <div className="bg-white rounded-2xl border border-slate-200 p-4 fade-in">
-                    {previewUrl && (
-                        <button
-                            onClick={() => setPreviewOpen(true)}
-                            className="w-full bg-slate-50 rounded-lg overflow-hidden mb-3 border border-slate-200 hover:border-slate-400 transition flex items-center justify-center h-56"
-                            title="Click to enlarge"
-                        >
-                            <img src={previewUrl} alt="preview" className="max-h-full max-w-full object-contain" />
-                        </button>
+                    {currentPage && (
+                        <div className="mb-3">
+                            <div className="relative w-full bg-slate-50 rounded-lg overflow-hidden border border-slate-200 flex items-center justify-center" style={{ height: '460px' }}>
+                                <img
+                                    src={currentPage}
+                                    alt="preview"
+                                    className="max-h-full max-w-full object-contain cursor-zoom-in"
+                                    onClick={() => setPreviewOpen(true)}
+                                />
+                                {pageCount > 1 && (
+                                    <>
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setPageIdx(i => Math.max(0, i - 1)); }}
+                                            disabled={pageIdx === 0}
+                                            className="absolute left-2 top-1/2 -translate-y-1/2 w-9 h-9 bg-white/90 border border-slate-200 rounded-full flex items-center justify-center shadow disabled:opacity-30 hover:bg-white"
+                                            aria-label="Previous page"
+                                        >‹</button>
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setPageIdx(i => Math.min(pageCount - 1, i + 1)); }}
+                                            disabled={pageIdx >= pageCount - 1}
+                                            className="absolute right-2 top-1/2 -translate-y-1/2 w-9 h-9 bg-white/90 border border-slate-200 rounded-full flex items-center justify-center shadow disabled:opacity-30 hover:bg-white"
+                                            aria-label="Next page"
+                                        >›</button>
+                                        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-black/60 text-white text-[11px] px-2 py-0.5 rounded-full">
+                                            {pageIdx + 1} / {pageCount}
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
                     )}
                     <div className="flex items-start justify-between gap-3 mb-3">
                         <div className="min-w-0 flex-1">
@@ -997,12 +1143,28 @@ Respond with STRICT JSON ONLY matching this schema:
                             </span>
                         )}
                     </div>
-                    {previewOpen && previewUrl && (
+                    {previewOpen && pageCount > 0 && (
                         <div
-                            className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6 cursor-zoom-out"
+                            className="fixed inset-0 bg-black/90 z-50 overflow-y-auto cursor-zoom-out"
                             onClick={() => setPreviewOpen(false)}
                         >
-                            <img src={previewUrl} alt="preview" className="max-w-full max-h-full rounded-lg shadow-2xl" />
+                            <div className="min-h-full flex flex-col items-center py-8 gap-4 px-4">
+                                {pages.map((url, i) => (
+                                    <img
+                                        key={i}
+                                        src={url}
+                                        alt={`page ${i + 1}`}
+                                        className="max-w-5xl w-full rounded shadow-2xl"
+                                        onClick={(e) => e.stopPropagation()}
+                                    />
+                                ))}
+                                <button
+                                    onClick={() => setPreviewOpen(false)}
+                                    className="fixed top-4 right-4 bg-white/90 text-slate-900 px-3 py-1.5 rounded-full text-sm font-medium"
+                                >
+                                    Close
+                                </button>
+                            </div>
                         </div>
                     )}
 
@@ -1177,11 +1339,11 @@ Respond with STRICT JSON ONLY matching this schema:
                     id, file, originalName: file.name, status: 'waiting',
                     proposal: null, edits: { folderId: '', filename: '' }, error: null, webViewLink: null,
                     waitingReason: 'Queued…',
-                    previewUrl: null,
+                    previewUrls: [],
                 }]);
-                // Generate preview async (non-blocking)
-                generatePreview(file).then(url => {
-                    if (url) updateItem(id, { previewUrl: url });
+                // Generate previews async — page 1 appears fast, rest fill in as they render
+                generatePreviews(file, (pagesSoFar) => {
+                    updateItem(id, { previewUrls: pagesSoFar });
                 }).catch(() => {});
                 // Chain onto the queue so calls run sequentially
                 geminiQueueRef.current = geminiQueueRef.current.then(async () => {
