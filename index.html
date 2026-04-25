@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v2.7-apr23 taly-categories';
+        const APP_VERSION = 'v2.8-apr23 scrollable-preview';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -430,33 +430,38 @@
             return null;
         };
 
-        // Guess a brand/company name and doc type from OCR text. Used for non-date
-        // filename patterns like "COMPANY - DOC TYPE.pdf" (typical for product manuals).
-        // Rough heuristic — expect to miss ~30% of the time. Review card lets user fix.
+        // Guess a brand/company name and doc type from OCR text. Picks the most-frequent
+        // capitalized phrase as the brand (real brands repeat through manuals).
         const guessCompanyAndType = (text) => {
             if (!text) return { company: null, type: null };
-            const head = text.slice(0, 1500);
+            const head = text.slice(0, 5000);
             const stop = new Set([
-                'The','This','Your','User','Owner','Model','Serial','Please','Read',
-                'Before','After','For','And','With','Thank','Table','Contents','Chapter',
-                'Section','Page','Note','Warning','Caution','Important','Safety',
+                'The','This','That','These','Those','Your','Yours','User','Owner','Model','Serial','Please','Read',
+                'Before','After','For','And','But','Or','With','Without','Thank','Thanks','Table','Contents','Chapter',
+                'Section','Page','Note','Warning','Caution','Important','Safety','Address','Email','Phone','Web',
+                'Website','Made','New','Used','Item','Product','Description','Customer','Service','Support',
+                'Manufacturer','From','Date','Dear','Hello','Step','Step1','Step2','Setup','Refer','Refer','Always',
+                'Never','When','While','During',
             ]);
-            // Find candidate capitalized words/brands in order of appearance
-            const seen = new Set();
-            let company = null;
+            // Tally candidate capitalized words/phrases by frequency
+            const counts = new Map();
             const re = /\b([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]+)?)\b/g;
             let m;
             while ((m = re.exec(head))) {
                 const w = m[1];
                 const first = w.split(/\s+/)[0];
-                if (stop.has(first) || seen.has(w)) continue;
-                seen.add(w);
-                company = w;
-                break;
+                if (stop.has(first)) continue;
+                counts.set(w, (counts.get(w) || 0) + 1);
             }
-            // Detect doc type
+            // Pick most-frequent (real brands repeat); ties broken by length (longer = more specific)
+            let company = null, bestScore = 0;
+            for (const [w, c] of counts) {
+                const score = c * 10 + w.length;
+                if (score > bestScore) { bestScore = score; company = w; }
+            }
+            // Doc type detection
             let type = null;
-            const typeMatch = head.match(/\b(user\s+(?:manual|guide)|owner'?s\s+manual|installation\s+guide|quick\s+start(?:\s+guide)?|warranty|instructions?|reference\s+guide|setup\s+guide)\b/i);
+            const typeMatch = head.match(/\b(instruction\s+manual|user\s+(?:manual|guide)|owner'?s\s+manual|installation\s+guide|quick\s+start(?:\s+guide)?|warranty|instructions?|reference\s+guide|setup\s+guide|user\s+booklet)\b/i);
             if (typeMatch) {
                 type = typeMatch[1].replace(/\s+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
             }
@@ -559,9 +564,18 @@
                     filename = adapted + (exampleExt || ext);
                     reasoning = `Matched "${topFolder.name}"; ${note}.`;
                 } else {
-                    // Couldn't adapt — keep the original filename instead of reusing the example verbatim
-                    filename = originalFilename;
-                    reasoning = `Matched "${topFolder.name}" by keyword. Couldn't auto-adapt filename — kept original. Example in folder: "${example}".`;
+                    // Couldn't adapt template. Try to build a name from the doc heuristic instead.
+                    const { company: c2, type: t2 } = guessCompanyAndType(docText);
+                    if (c2 && t2) {
+                        filename = `${c2} - ${t2}${exampleExt || ext}`;
+                        reasoning = `Matched "${topFolder.name}". Couldn't adapt template — used "${c2} - ${t2}" from document. Verify.`;
+                    } else if (c2) {
+                        filename = `${c2}${exampleExt || ext}`;
+                        reasoning = `Matched "${topFolder.name}". Found brand "${c2}" in document — please add doc type. Example: "${example}".`;
+                    } else {
+                        filename = originalFilename;
+                        reasoning = `Matched "${topFolder.name}". No identifiable info in doc. Example in folder: "${example}".`;
+                    }
                 }
             } else if (topFolder) {
                 // Folder has no examples — fall back to docdate + original base
@@ -1083,10 +1097,6 @@ Respond with STRICT JSON ONLY matching this schema:
             const pages = previewUrls || [];
             const pageCount = pages.length;
             const [previewOpen, setPreviewOpen] = useState(false);
-            const [pageIdx, setPageIdx] = useState(0);
-            // Clamp pageIdx if page count shrinks (shouldn't, but safe)
-            useEffect(() => { if (pageIdx >= pageCount && pageCount > 0) setPageIdx(0); }, [pageCount]);
-            const currentPage = pages[pageIdx] || pages[0] || null;
             const folderOptions = useMemo(
                 () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
                 [folderIndex]
@@ -1101,34 +1111,29 @@ Respond with STRICT JSON ONLY matching this schema:
 
             return (
                 <div className="bg-white rounded-2xl border border-slate-200 p-4 fade-in">
-                    {currentPage && (
+                    {pageCount > 0 && (
                         <div className="mb-3">
-                            <div className="relative w-full bg-slate-50 rounded-lg overflow-hidden border border-slate-200 flex items-center justify-center" style={{ height: '460px' }}>
-                                <img
-                                    src={currentPage}
-                                    alt="preview"
-                                    className="max-h-full max-w-full object-contain cursor-zoom-in"
-                                    onClick={() => setPreviewOpen(true)}
-                                />
-                                {pageCount > 1 && (
-                                    <>
-                                        <button
-                                            onClick={(e) => { e.stopPropagation(); setPageIdx(i => Math.max(0, i - 1)); }}
-                                            disabled={pageIdx === 0}
-                                            className="absolute left-2 top-1/2 -translate-y-1/2 w-9 h-9 bg-white/90 border border-slate-200 rounded-full flex items-center justify-center shadow disabled:opacity-30 hover:bg-white"
-                                            aria-label="Previous page"
-                                        >‹</button>
-                                        <button
-                                            onClick={(e) => { e.stopPropagation(); setPageIdx(i => Math.min(pageCount - 1, i + 1)); }}
-                                            disabled={pageIdx >= pageCount - 1}
-                                            className="absolute right-2 top-1/2 -translate-y-1/2 w-9 h-9 bg-white/90 border border-slate-200 rounded-full flex items-center justify-center shadow disabled:opacity-30 hover:bg-white"
-                                            aria-label="Next page"
-                                        >›</button>
-                                        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-black/60 text-white text-[11px] px-2 py-0.5 rounded-full">
-                                            {pageIdx + 1} / {pageCount}
+                            <div
+                                className="relative w-full bg-slate-50 rounded-lg border border-slate-200 overflow-y-auto"
+                                style={{ height: '500px' }}
+                            >
+                                <div className="flex flex-col items-center gap-3 py-3 px-3">
+                                    {pages.map((url, i) => (
+                                        <div key={i} className="relative w-full">
+                                            <img
+                                                src={url}
+                                                alt={`page ${i + 1}`}
+                                                className="w-full rounded shadow-sm cursor-zoom-in"
+                                                onClick={() => setPreviewOpen(true)}
+                                            />
+                                            {pageCount > 1 && (
+                                                <span className="absolute top-2 right-2 bg-black/60 text-white text-[10px] px-2 py-0.5 rounded-full">
+                                                    {i + 1} / {pageCount}
+                                                </span>
+                                            )}
                                         </div>
-                                    </>
-                                )}
+                                    ))}
+                                </div>
                             </div>
                         </div>
                     )}
