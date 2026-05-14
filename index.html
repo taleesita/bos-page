@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.1-apr26 dnd+fileall';
+        const APP_VERSION = 'v3.3-apr26 cle-category';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -330,14 +330,33 @@
                     if (text && text.length > 30) {
                         return { kind: 'text', text, textHint: file.name };
                     }
-                    // pdf.js got nothing useful — render page 1 + OCR (local mode) or send image (Gemini)
+                    // pdf.js got nothing useful — fall back to image / OCR
+                    if (useLocalMode) {
+                        // OCR up to 3 pages at higher resolution (2x scale) so Tesseract has
+                        // a better shot at stylized logos and gives us more text overall.
+                        if (onOcrProgress) onOcrProgress({ status: 'ocr_start' });
+                        const buf = await fileUtils.readAsArrayBuffer(file);
+                        const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+                        const numToOcr = Math.min(pdf.numPages, 3);
+                        let combined = '';
+                        for (let i = 1; i <= numToOcr; i++) {
+                            const page = await pdf.getPage(i);
+                            const viewport = page.getViewport({ scale: 2.0 });
+                            const canvas = document.createElement('canvas');
+                            canvas.width = viewport.width;
+                            canvas.height = viewport.height;
+                            await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                            const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+                            const pageText = await tesseractOcr(dataUrl, (m) => {
+                                if (onOcrProgress) onOcrProgress({ ...m, page: i, totalPages: numToOcr });
+                            });
+                            combined += pageText + '\n\n';
+                        }
+                        return { kind: 'text', text: combined || `File name: ${file.name}`, textHint: file.name };
+                    }
+                    // Gemini mode — single page as image
                     const dataUrl = await pdfFirstPageToDataUrl(file);
                     if (dataUrl) {
-                        if (useLocalMode) {
-                            if (onOcrProgress) onOcrProgress({ status: 'ocr_start' });
-                            const ocrText = await tesseractOcr(dataUrl, onOcrProgress);
-                            return { kind: 'text', text: ocrText || `File name: ${file.name}`, textHint: file.name };
-                        }
                         return { kind: 'image', mimeType: 'image/jpeg', dataUrl, textHint: file.name };
                     }
                 } catch (e) {
@@ -372,6 +391,10 @@
         // Folders whose path contains any of these (case-insensitive substring) are EXCLUDED
         // from auto-matching. They stay in the cascading dropdown for manual selection, but
         // the ranker won't suggest them. These are archived / read-only buckets.
+        // Folders to NEVER auto-route into — purely archival (school records, etc.)
+        // CLEs / NYS Bar are NOT excluded here because Taly still adds real CLE docs.
+        // Snack containers landing in CLE folders is handled by the new CLE semantic
+        // category requiring actual CLE vocabulary in the doc.
         const EXCLUDED_PATH_PATTERNS = [
             'rvrhs',
             'nyu',
@@ -444,6 +467,17 @@
                 name: 'orders',
                 docKeywords: ['amazon','amzn','ebay','order number','packing slip','marketplace','subtotal','shipping','sku','isbn','invoice number','tracking number','order date','shipped','seller','marketplace order'],
                 folderKeywords: ['order processing','orders','receipts','invoices','shipping','packing'],
+            },
+            {
+                name: 'cle',
+                docKeywords: [
+                    'cle credit','cle course','continuing legal education','mcle','cle hours',
+                    'legal ethics','professional responsibility','attorney','esq.','esquire',
+                    'bar association','bar admission','aba','american bar','nysba','new york state bar',
+                    'panel discussion','symposium','jurisdiction','case law','jurisprudence',
+                    'plaintiff','defendant','statute','precedent','litigation','course materials','panelist',
+                ],
+                folderKeywords: ['cle','nys bar','continuing legal','law journal','symposium','bar association'],
             },
         ];
 
@@ -553,6 +587,10 @@
                 }
                 s += Math.min(nameTokenHits, 15);
                 s += categoryBonusFor(f.path);
+                // Depth penalty — prefer shallower folders unless deeper one has a strong, unique match.
+                // depth 1 (root) = 0 penalty, depth 2 = -3, depth 3 = -6, etc.
+                const depth = (f.path.match(/ \/ /g) || []).length;
+                s -= depth * 3;
                 if (s > topScore) { topScore = s; topFolder = f; }
             }
 
@@ -1354,10 +1392,11 @@ Respond with STRICT JSON ONLY matching this schema:
                     // OCR progress callback — updates card to show OCR is happening
                     const onOcrProgress = (info) => {
                         if (info?.status === 'ocr_start') {
-                            updateItem(id, { status: 'waiting', waitingReason: 'Reading document (OCR, ~10s)…' });
+                            updateItem(id, { status: 'waiting', waitingReason: 'Reading document (OCR)…' });
                         } else if (info?.progress !== undefined && info?.status === 'recognizing text') {
                             const pct = Math.round(info.progress * 100);
-                            updateItem(id, { status: 'waiting', waitingReason: `Reading document (OCR) ${pct}%…` });
+                            const pageInfo = info.totalPages > 1 ? ` page ${info.page}/${info.totalPages}` : '';
+                            updateItem(id, { status: 'waiting', waitingReason: `Reading document (OCR)${pageInfo} ${pct}%…` });
                         }
                     };
 
