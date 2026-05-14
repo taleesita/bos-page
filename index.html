@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v2.8-apr23 scrollable-preview';
+        const APP_VERSION = 'v2.9-apr26 tesseract-fallback';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -292,14 +292,35 @@
             return canvas.toDataURL('image/jpeg', 0.7);
         };
 
-        // Decide what payload to send to Gemini for a given file:
-        //   - image → send image inline + let Gemini do vision
-        //   - PDF with native text → send text
-        //   - scanned/image PDF → render page 1 as image, send inline
-        //   - other → send text dump of filename
-        const prepareFileForNaming = async (file) => {
+        // Tesseract OCR — extract text from an image data URL.
+        // Used when pdf.js has nothing (scanned PDFs) and we have no LLM to vision-OCR.
+        const tesseractOcr = async (imageSource, onProgress) => {
+            if (!window.Tesseract) return '';
+            try {
+                const { createWorker } = Tesseract;
+                const worker = await createWorker('eng', undefined, {
+                    logger: onProgress ? (m) => onProgress(m) : undefined,
+                });
+                const result = await worker.recognize(imageSource);
+                await worker.terminate();
+                return (result?.data?.text || '').trim();
+            } catch (e) {
+                console.warn('Tesseract OCR failed:', e);
+                return '';
+            }
+        };
+
+        // Decide what payload to send for naming a file.
+        //   - useLocalMode = true: we have NO LLM. Always return TEXT (run OCR on scanned PDFs / images).
+        //   - useLocalMode = false: prefer image payload for scanned PDFs (Gemini handles vision).
+        const prepareFileForNaming = async (file, { useLocalMode = false, onOcrProgress = null } = {}) => {
             const type = file.type || '';
             if (type.startsWith('image/')) {
+                if (useLocalMode) {
+                    if (onOcrProgress) onOcrProgress({ status: 'ocr_start' });
+                    const text = await tesseractOcr(file, onOcrProgress);
+                    return { kind: 'text', text: text || `File name: ${file.name}`, textHint: file.name };
+                }
                 const dataUrl = await fileUtils.readAsDataURL(file);
                 return { kind: 'image', mimeType: type, dataUrl, textHint: file.name };
             }
@@ -309,16 +330,20 @@
                     if (text && text.length > 30) {
                         return { kind: 'text', text, textHint: file.name };
                     }
-                    // scanned PDF — send page 1 as image
+                    // pdf.js got nothing useful — render page 1 + OCR (local mode) or send image (Gemini)
                     const dataUrl = await pdfFirstPageToDataUrl(file);
                     if (dataUrl) {
+                        if (useLocalMode) {
+                            if (onOcrProgress) onOcrProgress({ status: 'ocr_start' });
+                            const ocrText = await tesseractOcr(dataUrl, onOcrProgress);
+                            return { kind: 'text', text: ocrText || `File name: ${file.name}`, textHint: file.name };
+                        }
                         return { kind: 'image', mimeType: 'image/jpeg', dataUrl, textHint: file.name };
                     }
                 } catch (e) {
                     console.warn('PDF extract failed, falling back to filename only', e);
                 }
             }
-            // fallback — just use the filename
             return { kind: 'text', text: `File name: ${file.name}`, textHint: file.name };
         };
 
@@ -396,6 +421,11 @@
                 name: 'health',
                 docKeywords: ['prescription','pharmacy','diagnosis','clinic','patient','dosage','medication','thermometer','blood pressure','medical'],
                 folderKeywords: ['health','medical','pharmacy'],
+            },
+            {
+                name: 'orders',
+                docKeywords: ['amazon','amzn','ebay','order number','packing slip','marketplace','subtotal','shipping','sku','isbn','invoice number','tracking number','order date','shipped','seller','marketplace order'],
+                folderKeywords: ['order processing','orders','receipts','invoices','shipping','packing'],
             },
         ];
 
@@ -1297,7 +1327,24 @@ Respond with STRICT JSON ONLY matching this schema:
                 try {
                     const { key, idx } = await waitForPrereqs(id);
                     updateItem(id, { status: 'processing', waitingReason: null });
-                    const payload = await prepareFileForNaming(file);
+
+                    // OCR progress callback — updates card to show OCR is happening
+                    const onOcrProgress = (info) => {
+                        if (info?.status === 'ocr_start') {
+                            updateItem(id, { status: 'waiting', waitingReason: 'Reading document (OCR, ~10s)…' });
+                        } else if (info?.progress !== undefined && info?.status === 'recognizing text') {
+                            const pct = Math.round(info.progress * 100);
+                            updateItem(id, { status: 'waiting', waitingReason: `Reading document (OCR) ${pct}%…` });
+                        }
+                    };
+
+                    // If no Gemini key, local mode runs Tesseract OCR on scanned PDFs/images
+                    // so we get extractable text to work with.
+                    const payload = await prepareFileForNaming(file, {
+                        useLocalMode: !key,
+                        onOcrProgress,
+                    });
+                    updateItem(id, { status: 'processing', waitingReason: null });
                     const docText = payload.kind === 'text' ? payload.text : '';
 
                     let proposal;
@@ -1315,7 +1362,10 @@ Respond with STRICT JSON ONLY matching this schema:
                             updateItem(id, { status: 'processing', waitingReason: null });
                         } catch (e) {
                             console.warn('[Bos Page] Gemini failed, falling back to local pattern match:', e.message);
-                            proposal = proposeLocally(idx.folders, docText, file.name);
+                            // For fallback, we may need to OCR — re-prepare in local mode
+                            const localPayload = payload.kind === 'text' ? payload :
+                                await prepareFileForNaming(file, { useLocalMode: true, onOcrProgress });
+                            proposal = proposeLocally(idx.folders, localPayload.text || '', file.name);
                             proposal.reasoning = `Gemini unavailable (${e.message.slice(0, 80)}). Used local match. ${proposal.reasoning}`;
                         }
                     } else {
