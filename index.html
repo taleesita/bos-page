@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v2.9-apr26 tesseract-fallback';
+        const APP_VERSION = 'v3.1-apr26 dnd+fileall';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -369,6 +369,24 @@
             return lines.join('\n');
         };
 
+        // Folders whose path contains any of these (case-insensitive substring) are EXCLUDED
+        // from auto-matching. They stay in the cascading dropdown for manual selection, but
+        // the ranker won't suggest them. These are archived / read-only buckets.
+        const EXCLUDED_PATH_PATTERNS = [
+            'rvrhs',
+            'nyu',
+            'cls',
+            'columbia law',
+            'high school',
+            'undergrad',
+            'general assembly',
+        ];
+
+        const isFolderExcluded = (folder) => {
+            const p = (folder?.path || '').toLowerCase();
+            return EXCLUDED_PATH_PATTERNS.some(pat => p.includes(pat));
+        };
+
         // Semantic categories: help the ranker understand that a document ABOUT baby items
         // belongs in a folder NAMED "Nutbear", even though those words never overlap directly.
         //
@@ -384,12 +402,12 @@
             },
             {
                 name: 'kitchen',
-                docKeywords: ['blender','toaster','microwave','oven','cooktop','mixer','kitchenware','cookware','spatula','dishwasher','instant pot','sous vide','espresso','coffee maker','kettle','cast iron','nonstick','cutlery','knife set','food processor','saucepan','cutting board'],
+                docKeywords: ['blender','toaster','microwave','oven','cooktop','mixer','kitchenware','cookware','spatula','dishwasher','instant pot','sous vide','espresso','coffee maker','kettle','cast iron','nonstick','cutlery','knife set','food processor','saucepan','cutting board','ice cream maker','stock pot','dutch oven','die cast','die-cast','aluminum stock pot','pots and pans','pot lid','nutribullet','vitamix','kitchenaid','breville','keurig'],
                 folderKeywords: ['kitchenware','kitchen','cookware'],
             },
             {
                 name: 'furniture_housewares',
-                docKeywords: ['vacuum cleaner','mattress','pillow','bedding','sheet','comforter','curtain','iron','humidifier','air purifier','fan','heater','lamp','lightbulb','vac seal','vacuum sealer','sofa','chair','table','desk','shelf','shelving','ottoman','nightstand','dresser','bookshelf','bed frame','rug','decor'],
+                docKeywords: ['vacuum cleaner','mattress','pillow','bedding','sheet','comforter','curtain','iron','humidifier','air purifier','fan','heater','lamp','lightbulb','vac seal','vacuum sealer','sofa','chair','table','desk','shelf','shelving','ottoman','nightstand','dresser','bookshelf','bed frame','rug','decor','picture frame','photo frame','wall hook','mounting bracket','floating shelf','hanging','frame backboard'],
                 folderKeywords: ['furniture','housewares','home goods','household','bedroom','living'],
             },
             {
@@ -404,7 +422,7 @@
             },
             {
                 name: 'electronics',
-                docKeywords: ['charger','battery','headphone','earbud','speaker','router','modem','wifi','bluetooth','hdmi','usb','laptop','monitor','keyboard','mouse','smart home','thermostat','soundbar','tv stand'],
+                docKeywords: ['charger','battery','headphone','earbud','speaker','router','modem','wifi','bluetooth','hdmi','usb','laptop','monitor','keyboard','mouse','smart home','thermostat','soundbar','tv stand','charging station','wireless charging','wireless charger','power bank','magnetic charger','3-in-1','dock','adapter','cable','airpods','snugluv'],
                 folderKeywords: ['electronics','tech','gadget','audio','computer'],
             },
             {
@@ -514,7 +532,7 @@
                 let bonus = 0;
                 for (const cat of categories) {
                     if (cat.folderKeywords.some(fk => pLower.includes(fk.toLowerCase()))) {
-                        bonus += 20; // strong weight — semantic category alignment
+                        bonus += 100; // strong weight — semantic category alignment dominates noise
                     }
                 }
                 return bonus;
@@ -524,11 +542,16 @@
             let topScore = 0;
             for (const f of folders) {
                 if (!f.files?.length) continue;
+                if (isFolderExcluded(f)) continue;
                 let s = 0;
                 for (const t of tokenize(f.path)) if (docTokens.has(t)) s += 3;
+                // Cap filename-token contributions per folder so a giant archive folder
+                // can't beat a semantically correct folder via accumulated noise.
+                let nameTokenHits = 0;
                 for (const name of f.files) {
-                    for (const t of tokenize(name)) if (docTokens.has(t)) s += 1;
+                    for (const t of tokenize(name)) if (docTokens.has(t)) nameTokenHits++;
                 }
+                s += Math.min(nameTokenHits, 15);
                 s += categoryBonusFor(f.path);
                 if (s > topScore) { topScore = s; topFolder = f; }
             }
@@ -590,17 +613,17 @@
                 }
 
                 if (note) {
-                    // We successfully adapted the template
-                    filename = adapted + (exampleExt || ext);
+                    // We successfully adapted the template — always use original file's extension
+                    filename = adapted + ext;
                     reasoning = `Matched "${topFolder.name}"; ${note}.`;
                 } else {
                     // Couldn't adapt template. Try to build a name from the doc heuristic instead.
                     const { company: c2, type: t2 } = guessCompanyAndType(docText);
                     if (c2 && t2) {
-                        filename = `${c2} - ${t2}${exampleExt || ext}`;
+                        filename = `${c2} - ${t2}${ext}`;
                         reasoning = `Matched "${topFolder.name}". Couldn't adapt template — used "${c2} - ${t2}" from document. Verify.`;
                     } else if (c2) {
-                        filename = `${c2}${exampleExt || ext}`;
+                        filename = `${c2}${ext}`;
                         reasoning = `Matched "${topFolder.name}". Found brand "${c2}" in document — please add doc type. Example: "${example}".`;
                     } else {
                         filename = originalFilename;
@@ -640,18 +663,20 @@
                 const pLower = path.toLowerCase();
                 let bonus = 0;
                 for (const cat of categories) {
-                    if (cat.folderKeywords.some(fk => pLower.includes(fk.toLowerCase()))) bonus += 20;
+                    if (cat.folderKeywords.some(fk => pLower.includes(fk.toLowerCase()))) bonus += 100;
                 }
                 return bonus;
             };
             const scored = folders
-                .filter(f => f.files?.length)
+                .filter(f => f.files?.length && !isFolderExcluded(f))
                 .map(f => {
                     let score = 0;
                     for (const t of tokenize(f.path)) if (docTokens.has(t)) score += 3;
+                    let nameTokenHits = 0;
                     for (const name of f.files) {
-                        for (const t of tokenize(name)) if (docTokens.has(t)) score += 1;
+                        for (const t of tokenize(name)) if (docTokens.has(t)) nameTokenHits++;
                     }
+                    score += Math.min(nameTokenHits, 15);
                     score += categoryBonusFor(f.path);
                     return { f, score };
                 });
@@ -1291,9 +1316,7 @@ Respond with STRICT JSON ONLY matching this schema:
         // ============================================================
         const UploadTab = ({ token, folderIndex, apiKey, testMode, refreshIndex }) => {
             const [items, setItems] = useState([]);
-            const [isDragging, setIsDragging] = useState(false);
             const fileInputRef = useRef(null);
-            const dragCounter = useRef(0);
 
             const updateItem = (id, patch) => {
                 setItems(prev => prev.map(it => it.id === id ? { ...it, ...patch } : it));
@@ -1425,42 +1448,54 @@ Respond with STRICT JSON ONLY matching this schema:
                 files.forEach(processFile);
             };
 
-            const onDragEnter = (e) => {
-                e.preventDefault();
-                dragCounter.current++;
-                if (e.dataTransfer?.items?.length) setIsDragging(true);
-            };
-            const onDragLeave = (e) => {
-                e.preventDefault();
-                dragCounter.current--;
-                if (dragCounter.current <= 0) { setIsDragging(false); dragCounter.current = 0; }
-            };
-            const onDragOver = (e) => { e.preventDefault(); };
-            const onDrop = (e) => {
-                e.preventDefault();
-                setIsDragging(false);
-                dragCounter.current = 0;
-                if (e.dataTransfer?.files?.length) onFilesSelected(e.dataTransfer.files);
-            };
+            // Listen for files dropped anywhere on the page (dispatched from App-level drag handler)
+            useEffect(() => {
+                const handler = (e) => {
+                    const files = e.detail;
+                    if (files?.length) onFilesSelected(files);
+                };
+                window.addEventListener('bospage:files', handler);
+                return () => window.removeEventListener('bospage:files', handler);
+            }, []);
 
-            const handleConfirm = async (id) => {
-                const it = items.find(x => x.id === id);
-                if (!it) return;
-                updateItem(id, { status: 'uploading' });
+            // Upload one item to Drive — shared by single-click and bulk "File all"
+            const uploadOne = async (it) => {
+                if (!it || !it.edits.folderId || !it.edits.filename) return;
+                updateItem(it.id, { status: 'uploading' });
                 try {
-                    // In test mode, route to test parent folder if configured; else just prefix filename
                     const targetFolderId = testMode && TEST_PARENT_FOLDER_ID
                         ? TEST_PARENT_FOLDER_ID
                         : it.edits.folderId;
                     const filename = testMode ? `[TEST] ${it.edits.filename}` : it.edits.filename;
                     const uploaded = await drive.uploadNew(token, it.file, filename, targetFolderId);
-                    updateItem(id, {
+                    updateItem(it.id, {
                         status: 'done',
                         edits: { ...it.edits, filename },
                         webViewLink: uploaded.webViewLink,
                     });
                 } catch (e) {
-                    updateItem(id, { status: 'error', error: 'Upload failed: ' + e.message });
+                    updateItem(it.id, { status: 'error', error: 'Upload failed: ' + e.message });
+                }
+            };
+
+            const handleConfirm = async (id) => {
+                const it = items.find(x => x.id === id);
+                if (it) await uploadOne(it);
+            };
+
+            // Bulk file all ready items, sequentially (so Drive doesn't get hammered)
+            const [bulkUploading, setBulkUploading] = useState(false);
+            const handleConfirmAll = async () => {
+                setBulkUploading(true);
+                try {
+                    const snapshot = items.filter(x =>
+                        x.status === 'ready' && x.edits.folderId && x.edits.filename
+                    );
+                    for (const it of snapshot) {
+                        await uploadOne(it);
+                    }
+                } finally {
+                    setBulkUploading(false);
                 }
             };
 
@@ -1474,22 +1509,7 @@ Respond with STRICT JSON ONLY matching this schema:
             const doneCount = items.filter(x => x.status === 'done').length;
 
             return (
-                <div
-                    className="p-4 pb-8 relative"
-                    onDragEnter={onDragEnter}
-                    onDragLeave={onDragLeave}
-                    onDragOver={onDragOver}
-                    onDrop={onDrop}
-                >
-                    {isDragging && (
-                        <div className="fixed inset-0 bg-slate-900/20 backdrop-blur-sm z-50 flex items-center justify-center pointer-events-none">
-                            <div className="bg-white rounded-3xl px-10 py-8 shadow-xl border-2 border-dashed border-slate-900">
-                                <div className="text-5xl mb-3 text-center">📥</div>
-                                <div className="text-lg font-semibold">Drop to file</div>
-                            </div>
-                        </div>
-                    )}
-
+                <div className="p-4 pb-8 relative">
                     <button
                         onClick={() => fileInputRef.current?.click()}
                         className="w-full border-2 border-dashed border-slate-300 rounded-2xl p-8 text-center hover:border-slate-400 hover:bg-white transition"
@@ -1507,7 +1527,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     />
 
                     {items.length > 0 && (
-                        <div className="mt-6 space-y-3">
+                        <div className="mt-6 space-y-3 pb-24">
                             <div className="flex items-center justify-between">
                                 <h3 className="text-sm font-semibold text-slate-700">
                                     {items.length} file{items.length === 1 ? '' : 's'}
@@ -1531,6 +1551,29 @@ Respond with STRICT JSON ONLY matching this schema:
                             ))}
                         </div>
                     )}
+
+                    {/* Sticky "File all" action bar — appears when 2+ items are ready */}
+                    {(() => {
+                        const readyItems = items.filter(x => x.status === 'ready' && x.edits.folderId && x.edits.filename);
+                        if (readyItems.length < 2) return null;
+                        return (
+                            <div className="fixed bottom-16 md:bottom-4 inset-x-0 z-30 px-4 pointer-events-none">
+                                <div className="max-w-2xl mx-auto pointer-events-auto">
+                                    <button
+                                        onClick={handleConfirmAll}
+                                        disabled={bulkUploading}
+                                        className="w-full bg-slate-900 text-white rounded-xl py-3 font-semibold shadow-2xl active:scale-[0.99] disabled:opacity-60 flex items-center justify-center gap-2"
+                                    >
+                                        {bulkUploading ? (
+                                            <><Spinner size={16}/> Filing {readyItems.length}…</>
+                                        ) : (
+                                            <>File all {readyItems.length}</>
+                                        )}
+                                    </button>
+                                </div>
+                            </div>
+                        );
+                    })()}
 
                     {!apiKey && items.length === 0 && (
                         <div className="mt-8 text-center text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3">
@@ -1857,8 +1900,52 @@ Respond with STRICT JSON ONLY matching this schema:
             const [testMode, setTestModeState] = useState(storage.get(STORAGE_KEYS.testMode) === 'true');
             const [folderIndex, setFolderIndex] = useState(storage.getJSON(STORAGE_KEYS.folderIndex));
             const [indexStatus, setIndexStatus] = useState('');
+            const [globalDragging, setGlobalDragging] = useState(false);
+            const dragCounter = useRef(0);
 
             useEffect(() => { storage.set(STORAGE_KEYS.activeTab, activeTab); }, [activeTab]);
+
+            // Page-wide drag-and-drop. Files dropped anywhere → switch to Upload tab + dispatch to UploadTab.
+            useEffect(() => {
+                if (!user || !token) return; // no point dragging until signed in
+                const onDragEnter = (e) => {
+                    e.preventDefault();
+                    // Only show overlay for FILE drags (not text/element drags)
+                    if (e.dataTransfer?.types?.includes('Files')) {
+                        dragCounter.current++;
+                        setGlobalDragging(true);
+                    }
+                };
+                const onDragLeave = (e) => {
+                    e.preventDefault();
+                    dragCounter.current--;
+                    if (dragCounter.current <= 0) {
+                        dragCounter.current = 0;
+                        setGlobalDragging(false);
+                    }
+                };
+                const onDragOver = (e) => { e.preventDefault(); };
+                const onDrop = (e) => {
+                    e.preventDefault();
+                    setGlobalDragging(false);
+                    dragCounter.current = 0;
+                    if (e.dataTransfer?.files?.length) {
+                        const files = Array.from(e.dataTransfer.files);
+                        setActiveTab('upload');
+                        window.dispatchEvent(new CustomEvent('bospage:files', { detail: files }));
+                    }
+                };
+                window.addEventListener('dragenter', onDragEnter);
+                window.addEventListener('dragleave', onDragLeave);
+                window.addEventListener('dragover', onDragOver);
+                window.addEventListener('drop', onDrop);
+                return () => {
+                    window.removeEventListener('dragenter', onDragEnter);
+                    window.removeEventListener('dragleave', onDragLeave);
+                    window.removeEventListener('dragover', onDragOver);
+                    window.removeEventListener('drop', onDrop);
+                };
+            }, [user, token]);
 
             const setTestMode = (v) => {
                 setTestModeState(v);
@@ -2031,6 +2118,15 @@ Respond with STRICT JSON ONLY matching this schema:
                         )}
                     </main>
                     <TabBar activeTab={activeTab} setActiveTab={setActiveTab} />
+                    {globalDragging && (
+                        <div className="fixed inset-0 bg-slate-900/30 backdrop-blur-sm z-[100] flex items-center justify-center pointer-events-none">
+                            <div className="bg-white rounded-3xl px-12 py-10 shadow-2xl border-4 border-dashed border-slate-900 max-w-md mx-4 text-center">
+                                <div className="text-6xl mb-3">📥</div>
+                                <div className="text-2xl font-semibold">Drop to file</div>
+                                <div className="text-sm text-slate-500 mt-2">Anywhere on the page</div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         };
