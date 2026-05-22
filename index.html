@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.3-apr26 cle-category';
+        const APP_VERSION = 'v3.4-apr26 dupe-detector';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -122,6 +122,33 @@
             activeTab: 'bospage_active_tab',
             userEmail: 'bospage_user_email',
             userName: 'bospage_user_name',
+            recentUploads: 'bospage_recent_uploads',
+        };
+
+        // Recent-upload tracking for duplicate detection.
+        // Records {hash, filename, folderPath, folderId, webViewLink, when} per successful file.
+        // Keeps last RECENT_UPLOADS_LIMIT entries so we can detect identical files coming back.
+        const RECENT_UPLOADS_LIMIT = 1000;
+
+        const computeFileHash = async (file) => {
+            if (!crypto?.subtle?.digest) return null;
+            const buf = await file.arrayBuffer();
+            const hash = await crypto.subtle.digest('SHA-256', buf);
+            return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+        };
+
+        const recentUploads = {
+            list: () => storage.getJSON(STORAGE_KEYS.recentUploads, []),
+            find: (hash) => {
+                if (!hash) return null;
+                return recentUploads.list().find(x => x.hash === hash) || null;
+            },
+            add: (entry) => {
+                const list = recentUploads.list();
+                list.unshift(entry);
+                if (list.length > RECENT_UPLOADS_LIMIT) list.length = RECENT_UPLOADS_LIMIT;
+                storage.setJSON(STORAGE_KEYS.recentUploads, list);
+            },
         };
 
         // ============================================================
@@ -1185,8 +1212,8 @@ Respond with STRICT JSON ONLY matching this schema:
         // REVIEW CARD — shared by Upload and Inbox tabs
         // Represents one file in various states (processing, proposing, filing, done).
         // ============================================================
-        const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip, onRetry }) => {
-            const { status, originalName, proposal, edits, error, webViewLink, waitingReason, previewUrls } = item;
+        const ReviewCard = ({ item, folderIndex, onChange, onConfirm, onSkip, onRetry, onFileAnyway }) => {
+            const { status, originalName, proposal, edits, error, webViewLink, waitingReason, previewUrls, dupeOf } = item;
             const pages = previewUrls || [];
             const pageCount = pages.length;
             const [previewOpen, setPreviewOpen] = useState(false);
@@ -1279,6 +1306,35 @@ Respond with STRICT JSON ONLY matching this schema:
                                 <span>{waitingReason || 'Queued…'}</span>
                             </div>
                             <button onClick={() => onSkip(item.id)} className="text-xs underline">Cancel</button>
+                        </div>
+                    )}
+
+                    {status === 'duplicate' && dupeOf && (
+                        <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-3">
+                            <div className="font-semibold mb-1 flex items-center gap-2">
+                                <span>⚠️</span>
+                                <span>Duplicate detected</span>
+                            </div>
+                            <div className="text-xs text-rose-700 mb-3">
+                                Already filed as <span className="font-medium">{dupeOf.filename}</span>
+                                {dupeOf.folderPath && <> in <span className="font-medium">{dupeOf.folderPath}</span></>}
+                                {dupeOf.when && <> ({new Date(dupeOf.when).toLocaleDateString()})</>}.
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-xs">
+                                {dupeOf.webViewLink && (
+                                    <a href={dupeOf.webViewLink} target="_blank" rel="noopener" className="px-3 py-1.5 bg-white border border-rose-200 rounded-lg font-medium hover:bg-rose-50">
+                                        Open existing
+                                    </a>
+                                )}
+                                <button onClick={() => onSkip(item.id)} className="px-3 py-1.5 bg-slate-900 text-white rounded-lg font-medium">
+                                    Skip (recommended)
+                                </button>
+                                {onFileAnyway && (
+                                    <button onClick={() => onFileAnyway(item.id)} className="px-3 py-1.5 bg-white border border-rose-200 rounded-lg">
+                                        File anyway
+                                    </button>
+                                )}
+                            </div>
                         </div>
                     )}
 
@@ -1384,8 +1440,20 @@ Respond with STRICT JSON ONLY matching this schema:
             const geminiQueueRef = useRef(Promise.resolve());
             const GEMINI_INTERVAL_MS = 5000; // ~12 req/min — stays under 2.0 Flash free tier's 15 RPM cap
 
-            const runGeminiForItem = async (id, file) => {
+            const runGeminiForItem = async (id, file, opts = {}) => {
                 try {
+                    // Duplicate check — compute content hash and look it up in localStorage
+                    if (!opts.skipDupeCheck) {
+                        updateItem(id, { status: 'waiting', waitingReason: 'Checking for duplicates…' });
+                        const hash = await computeFileHash(file);
+                        const dupe = recentUploads.find(hash);
+                        if (dupe) {
+                            updateItem(id, { status: 'duplicate', dupeOf: dupe, contentHash: hash });
+                            return;
+                        }
+                        updateItem(id, { contentHash: hash });
+                    }
+
                     const { key, idx } = await waitForPrereqs(id);
                     updateItem(id, { status: 'processing', waitingReason: null });
 
@@ -1512,6 +1580,18 @@ Respond with STRICT JSON ONLY matching this schema:
                         edits: { ...it.edits, filename },
                         webViewLink: uploaded.webViewLink,
                     });
+                    // Record for future duplicate detection
+                    if (it.contentHash) {
+                        const folder = folderIndexRef.current?.folders?.find(f => f.id === it.edits.folderId);
+                        recentUploads.add({
+                            hash: it.contentHash,
+                            filename,
+                            folderId: it.edits.folderId,
+                            folderPath: folder?.path || '',
+                            webViewLink: uploaded.webViewLink || '',
+                            when: Date.now(),
+                        });
+                    }
                 } catch (e) {
                     updateItem(it.id, { status: 'error', error: 'Upload failed: ' + e.message });
                 }
@@ -1520,6 +1600,17 @@ Respond with STRICT JSON ONLY matching this schema:
             const handleConfirm = async (id) => {
                 const it = items.find(x => x.id === id);
                 if (it) await uploadOne(it);
+            };
+
+            // User chose to file a flagged duplicate anyway — re-queue processing, skip dupe check
+            const handleFileAnyway = (id) => {
+                const it = items.find(x => x.id === id);
+                if (!it) return;
+                updateItem(id, { status: 'waiting', waitingReason: 'Queued (filing anyway)…', dupeOf: null });
+                geminiQueueRef.current = geminiQueueRef.current.then(async () => {
+                    await runGeminiForItem(id, it.file, { skipDupeCheck: true });
+                    await new Promise(r => setTimeout(r, GEMINI_INTERVAL_MS));
+                });
             };
 
             // Bulk file all ready items, sequentially (so Drive doesn't get hammered)
@@ -1586,6 +1677,7 @@ Respond with STRICT JSON ONLY matching this schema:
                                     onConfirm={handleConfirm}
                                     onSkip={handleSkip}
                                     onRetry={retryItem}
+                                    onFileAnyway={handleFileAnyway}
                                 />
                             ))}
                         </div>
