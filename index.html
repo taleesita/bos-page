@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.4-apr26 dupe-detector';
+        const APP_VERSION = 'v3.5-apr26 drive-hash-index';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -151,6 +151,23 @@
             },
         };
 
+        // Drive-wide hash index — populated during refreshIndex by reading sha256Checksum
+        // from existing Drive files. Covers files filed BEFORE the dupe detector existed.
+        // Capped at 5000 most-recently-modified files to fit in localStorage.
+        const DRIVE_HASH_INDEX_LIMIT = 5000;
+        const DRIVE_HASH_INDEX_KEY = 'bospage_drive_hash_index';
+        const driveHashIndex = {
+            map: () => storage.getJSON(DRIVE_HASH_INDEX_KEY, {}),
+            find: (hash) => {
+                if (!hash) return null;
+                return driveHashIndex.map()[hash] || null;
+            },
+            save: (mapObj) => storage.setJSON(DRIVE_HASH_INDEX_KEY, mapObj),
+        };
+
+        // Combined lookup — check both sources
+        const findDuplicate = (hash) => recentUploads.find(hash) || driveHashIndex.find(hash);
+
         // ============================================================
         // GOOGLE DRIVE API WRAPPERS
         // ============================================================
@@ -159,7 +176,7 @@
             listChildren: async (token, folderId, pageToken) => {
                 const params = new URLSearchParams({
                     q: `'${folderId}' in parents and trashed = false`,
-                    fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink)',
+                    fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, webViewLink, sha256Checksum)',
                     pageSize: '1000',
                     orderBy: 'name',
                 });
@@ -1442,11 +1459,12 @@ Respond with STRICT JSON ONLY matching this schema:
 
             const runGeminiForItem = async (id, file, opts = {}) => {
                 try {
-                    // Duplicate check — compute content hash and look it up in localStorage
+                    // Duplicate check — compute content hash and look it up against
+                    // both recentUploads (app-filed) AND driveHashIndex (any Drive file).
                     if (!opts.skipDupeCheck) {
                         updateItem(id, { status: 'waiting', waitingReason: 'Checking for duplicates…' });
                         const hash = await computeFileHash(file);
-                        const dupe = recentUploads.find(hash);
+                        const dupe = findDuplicate(hash);
                         if (dupe) {
                             updateItem(id, { status: 'duplicate', dupeOf: dupe, contentHash: hash });
                             return;
@@ -2091,6 +2109,7 @@ Respond with STRICT JSON ONLY matching this schema:
                 const FOLDER_MIME = 'application/vnd.google-apps.folder';
                 const folders = []; // { id, name, path, rootId, files: [names] }
                 const visited = new Set(); // folder IDs we've already walked — prevents duplicate walks
+                const hashCandidates = []; // { hash, filename, folderId, folderPath, webViewLink, when }
                 let folderCount = 0;
                 let fileCount = 0;
 
@@ -2138,6 +2157,17 @@ Respond with STRICT JSON ONLY matching this schema:
                             } else {
                                 fileNames.push(c.name);
                                 fileCount++;
+                                // Capture hash for dupe detection if Drive provided one
+                                if (c.sha256Checksum) {
+                                    hashCandidates.push({
+                                        hash: c.sha256Checksum,
+                                        filename: c.name,
+                                        folderId: cur.id,
+                                        folderPath: cur.path,
+                                        webViewLink: c.webViewLink || '',
+                                        when: c.modifiedTime ? new Date(c.modifiedTime).getTime() : 0,
+                                    });
+                                }
                             }
                         }
                         // Keep a cap per-folder so the LLM context doesn't blow up
@@ -2165,6 +2195,17 @@ Respond with STRICT JSON ONLY matching this schema:
                     } catch (e) {
                         // If localStorage overflows (big index), keep in-memory only
                         console.warn('Index too big to cache, keeping in memory only', e);
+                    }
+                    // Build/save Drive hash index — sorted by recency, top 5000 only
+                    try {
+                        hashCandidates.sort((a, b) => (b.when || 0) - (a.when || 0));
+                        const top = hashCandidates.slice(0, DRIVE_HASH_INDEX_LIMIT);
+                        const map = {};
+                        for (const h of top) map[h.hash] = h;
+                        driveHashIndex.save(map);
+                        console.log(`[Bos Page] Drive hash index: ${top.length} entries (from ${hashCandidates.length} hashed files)`);
+                    } catch (e) {
+                        console.warn('Could not save Drive hash index:', e);
                     }
                     setIndexStatus(`${folderCount} folders · ${fileCount} files · just now`);
                 } catch (e) {
