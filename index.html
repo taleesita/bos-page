@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.7-apr26 case-insensitive+manual-boost';
+        const APP_VERSION = 'v3.8-apr26 root-not-stolen';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -2142,6 +2142,10 @@ Respond with STRICT JSON ONLY matching this schema:
                 const folders = []; // { id, name, path, rootId, files: [names] }
                 const visited = new Set(); // folder IDs we've already walked — prevents duplicate walks
                 const hashCandidates = []; // { hash, filename, folderId, folderPath, webViewLink, when }
+                // Set of all designated root folder IDs — used to prevent one root's BFS
+                // from "claiming" another root that happens to be reachable as its child
+                // (Drive allows shared parents, so this can happen).
+                const rootIdSet = new Set(ROOT_FOLDER_IDS);
                 let folderCount = 0;
                 let fileCount = 0;
 
@@ -2161,8 +2165,18 @@ Respond with STRICT JSON ONLY matching this schema:
 
                 // BFS from a root folder
                 const walkRoot = async (rootId) => {
-                    const rootMeta = await drive.getMeta(token, rootId);
-                    if (visited.has(rootMeta.id)) return; // skip if already walked as part of another root
+                    let rootMeta;
+                    try {
+                        rootMeta = await drive.getMeta(token, rootId);
+                    } catch (e) {
+                        console.warn(`[Bos Page] Root ${rootId} failed to fetch:`, e.message);
+                        return;
+                    }
+                    console.log(`[Bos Page] Walking root: ${rootMeta.name} (${rootMeta.id})`);
+                    if (visited.has(rootMeta.id)) {
+                        console.warn(`[Bos Page] Root "${rootMeta.name}" already visited — likely reachable from another root`);
+                        return;
+                    }
                     const queue = [{ id: rootMeta.id, name: rootMeta.name, path: rootMeta.name, rootId: rootMeta.id }];
                     while (queue.length) {
                         const cur = queue.shift();
@@ -2178,7 +2192,9 @@ Respond with STRICT JSON ONLY matching this schema:
                         const fileNames = [];
                         for (const c of children) {
                             if (c.mimeType === FOLDER_MIME) {
-                                if (!visited.has(c.id)) {
+                                // Skip designated roots — they'll be walked by their own walkRoot call,
+                                // giving them their own root-level path instead of inheriting this parent's.
+                                if (!visited.has(c.id) && !rootIdSet.has(c.id)) {
                                     queue.push({
                                         id: c.id,
                                         name: c.name,
