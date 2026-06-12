@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.8-apr26 root-not-stolen';
+        const APP_VERSION = 'v3.9-apr26 slash-in-name-fix';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -87,6 +87,12 @@
 
         // Name of the Drive folder that the Apps Script drops email attachments into
         const INTAKE_FOLDER_NAME = '📥 Pending Review';
+
+        // Internal path separator. Folder names like "- Account / Expenses" contain " / ",
+        // so we use a sentinel character that can't appear in Drive folder names instead.
+        // Display: convert back to " / " via displayPath().
+        const PATH_SEP = '\u0001';
+        const displayPath = (p) => (p || '').split(PATH_SEP).join(' / ');
 
         // Parent used for [DUPE FOR TESTING] folders — same convention as expense tracker
         // TODO: set to a real Drive folder ID after first-run test-mode setup
@@ -117,8 +123,8 @@
             testMode: 'bospage_test_mode',
             accessToken: 'bospage_google_access_token',
             accessTokenExpiry: 'bospage_google_access_token_expiry',
-            folderIndex: 'bospage_folder_index',
-            folderIndexTs: 'bospage_folder_index_ts',
+            folderIndex: 'bospage_folder_index_v2',     // v2 uses new internal PATH_SEP format
+            folderIndexTs: 'bospage_folder_index_ts_v2',
             activeTab: 'bospage_active_tab',
             userEmail: 'bospage_user_email',
             userName: 'bospage_user_name',
@@ -425,7 +431,7 @@
             const lines = [];
             for (const f of folders) {
                 if (!f.files || !f.files.length) continue; // skip empty folders
-                lines.push(`PATH: ${f.path} [id=${f.id}]`);
+                lines.push(`PATH: ${displayPath(f.path)} [id=${f.id}]`);
                 const examples = f.files.slice(-3);
                 for (const n of examples) lines.push(`  - ${n}`);
             }
@@ -663,7 +669,7 @@
                 s += categoryBonusFor(f.path);
                 // Depth penalty — prefer shallower folders unless deeper one has a strong, unique match.
                 // depth 1 (root) = 0 penalty, depth 2 = -3, depth 3 = -6, etc.
-                const depth = (f.path.match(/ \/ /g) || []).length;
+                const depth = f.path.split(PATH_SEP).length - 1;
                 s -= depth * 3;
                 if (s > topScore) { topScore = s; topFolder = f; }
             }
@@ -1175,18 +1181,18 @@ Respond with STRICT JSON ONLY matching this schema:
         const CascadingFolderPicker = ({ folders, selectedId, onChange, disabled }) => {
             // Derive breadcrumbs from the currently-selected folder's path
             const selected = folders.find(f => f.id === selectedId);
-            const crumbs = selected ? selected.path.split(' / ') : [];
+            const crumbs = selected ? selected.path.split(PATH_SEP) : [];
 
             // All folders at a given depth under a given parent path
             const childrenOfPath = useMemo(() => {
                 return (parentPath) => {
-                    const parentDepth = parentPath ? parentPath.split(' / ').length : 0;
+                    const parentDepth = parentPath ? parentPath.split(PATH_SEP).length : 0;
                     return folders
                         .filter(f => {
-                            const parts = f.path.split(' / ');
+                            const parts = f.path.split(PATH_SEP);
                             if (parts.length !== parentDepth + 1) return false;
                             if (parentDepth === 0) return true;
-                            return parts.slice(0, parentDepth).join(' / ') === parentPath;
+                            return parts.slice(0, parentDepth).join(PATH_SEP) === parentPath;
                         })
                         .sort((a, b) => a.name.localeCompare(b.name));
                 };
@@ -1204,7 +1210,7 @@ Respond with STRICT JSON ONLY matching this schema:
             });
             // Deeper levels — only if preceding level has a selection
             for (let i = 0; i < crumbs.length; i++) {
-                const parentPath = crumbs.slice(0, i + 1).join(' / ');
+                const parentPath = crumbs.slice(0, i + 1).join(PATH_SEP);
                 const options = childrenOfPath(parentPath);
                 if (options.length === 0) break;
                 levels.push({
@@ -1221,7 +1227,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     if (levelIdx === 0) {
                         onChange('');
                     } else {
-                        const newPath = crumbs.slice(0, levelIdx).join(' / ');
+                        const newPath = crumbs.slice(0, levelIdx).join(PATH_SEP);
                         const parent = folders.find(f => f.path === newPath);
                         onChange(parent?.id || '');
                     }
@@ -1250,7 +1256,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     ))}
                     {selected && (
                         <div className="text-xs text-slate-500 mt-1">
-                            📁 {selected.path}
+                            📁 {displayPath(selected.path)}
                         </div>
                     )}
                 </div>
@@ -1267,7 +1273,7 @@ Respond with STRICT JSON ONLY matching this schema:
             const pageCount = pages.length;
             const [previewOpen, setPreviewOpen] = useState(false);
             const folderOptions = useMemo(
-                () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: f.path })).sort((a, b) => a.path.localeCompare(b.path)),
+                () => (folderIndex?.folders || []).map(f => ({ id: f.id, path: displayPath(f.path) })).sort((a, b) => a.path.localeCompare(b.path)),
                 [folderIndex]
             );
 
@@ -1553,7 +1559,7 @@ Respond with STRICT JSON ONLY matching this schema:
                         proposal = proposeLocally(idx.folders, docText, file.name);
                     }
 
-                    const folder = idx.folders.find(f => f.path === proposal.folder_path);
+                    const folder = idx.folders.find(f => displayPath(f.path) === proposal.folder_path || f.path === proposal.folder_path);
                     updateItem(id, {
                         status: 'ready',
                         proposal,
@@ -1637,7 +1643,7 @@ Respond with STRICT JSON ONLY matching this schema:
                             hash: it.contentHash,
                             filename,
                             folderId: it.edits.folderId,
-                            folderPath: folder?.path || '',
+                            folderPath: displayPath(folder?.path || ''),
                             webViewLink: uploaded.webViewLink || '',
                             when: Date.now(),
                         });
@@ -1835,7 +1841,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     const file = new File([blob], it.originalName, { type: it.mimeType });
                     const payload = await prepareFileForNaming(file);
                     const proposal = await callGemini(apiKey, payload, folderIndex, it.originalName);
-                    const folder = folderIndex.folders.find(f => f.path === proposal.folder_path);
+                    const folder = folderIndex.folders.find(f => displayPath(f.path) === proposal.folder_path || f.path === proposal.folder_path);
                     setItems(prev => prev.map(x => x.id === itemId ? {
                         ...x,
                         status: 'ready',
@@ -2198,7 +2204,7 @@ Respond with STRICT JSON ONLY matching this schema:
                                     queue.push({
                                         id: c.id,
                                         name: c.name,
-                                        path: `${cur.path} / ${c.name}`,
+                                        path: `${cur.path}${PATH_SEP}${c.name}`,
                                         rootId: cur.rootId,
                                     });
                                 }
@@ -2211,7 +2217,7 @@ Respond with STRICT JSON ONLY matching this schema:
                                         hash: c.sha256Checksum,
                                         filename: c.name,
                                         folderId: cur.id,
-                                        folderPath: cur.path,
+                                        folderPath: displayPath(cur.path),
                                         webViewLink: c.webViewLink || '',
                                         when: c.modifiedTime ? new Date(c.modifiedTime).getTime() : 0,
                                     });
