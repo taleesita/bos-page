@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.9-apr26 slash-in-name-fix';
+        const APP_VERSION = 'v3.10-apr26 stale-while-revalidate';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -2085,7 +2085,25 @@ Respond with STRICT JSON ONLY matching this schema:
             const [activeTab, setActiveTab] = useState(storage.get(STORAGE_KEYS.activeTab, 'upload'));
             const [apiKey, setApiKey] = useState(storage.get(STORAGE_KEYS.geminiKey, ''));
             const [testMode, setTestModeState] = useState(storage.get(STORAGE_KEYS.testMode) === 'true');
-            const [folderIndex, setFolderIndex] = useState(storage.getJSON(STORAGE_KEYS.folderIndex));
+            // Hydrate from v2 cache; fall back to legacy v1 cache (old " / " format) so
+            // we can still serve stale data while a fresh v2 walk runs in the background.
+            const [folderIndex, setFolderIndex] = useState(() => {
+                const v2 = storage.getJSON(STORAGE_KEYS.folderIndex);
+                if (v2 && v2.folders?.length) return v2;
+                // Migrate v1 in-memory (don't overwrite v2 storage — walk will do that)
+                const v1 = storage.getJSON('bospage_folder_index');
+                if (v1 && v1.folders?.length) {
+                    return {
+                        ...v1,
+                        folders: v1.folders.map(f => ({
+                            ...f,
+                            path: (f.path || '').split(' / ').join(PATH_SEP),
+                        })),
+                        _migratedFromV1: true,
+                    };
+                }
+                return null;
+            });
             const [indexStatus, setIndexStatus] = useState('');
             const [globalDragging, setGlobalDragging] = useState(false);
             const dragCounter = useRef(0);
@@ -2267,11 +2285,16 @@ Respond with STRICT JSON ONLY matching this schema:
                 }
             }, [token]);
 
-            // Auto-build index on first token acquisition if we don't have one cached or it's stale
+            // Stale-while-revalidate: on token acquisition, show cached index immediately
+            // and kick off a background refresh only when cache is missing OR older than 24h.
+            // During refresh, folderIndex keeps serving current value — files can still process.
             useEffect(() => {
                 if (!token) return;
                 const ts = parseInt(storage.get(STORAGE_KEYS.folderIndexTs, '0'), 10);
-                if (!folderIndex || Date.now() - ts > INDEX_TTL_MS) {
+                const needsFullFill = !folderIndex || folderIndex._migratedFromV1;
+                const isStale = Date.now() - ts > INDEX_TTL_MS;
+                if (needsFullFill || isStale) {
+                    // Fire background refresh; existing folderIndex state remains valid meanwhile
                     refreshIndex();
                 } else {
                     const fileCount = (folderIndex.folders || []).reduce((s, f) => s + (f.files?.length || 0), 0);
