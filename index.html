@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.13-apr26 refill-partial-cache';
+        const APP_VERSION = 'v3.14-apr26 force-refresh';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -2059,7 +2059,7 @@ Respond with STRICT JSON ONLY matching this schema:
                                 <p className="text-xs text-slate-500 mt-1">{indexStatus || 'Not loaded.'}</p>
                             </div>
                             <button
-                                onClick={refreshIndex}
+                                onClick={() => refreshIndex({ force: true })}
                                 className="px-3 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium active:scale-[0.98]"
                             >
                                 Refresh
@@ -2176,21 +2176,23 @@ Respond with STRICT JSON ONLY matching this schema:
 
             // Recursively walk the 8 root folders, collecting every subfolder's path
             // and up to MAX_EXAMPLES filenames per folder. Cached in localStorage.
-            const refreshIndex = useCallback(async () => {
+            const refreshIndex = useCallback(async (opts = {}) => {
                 if (!token) return;
-                // Cross-tab lock — if another tab/refresh started a walk in the last 3 min, skip
-                // to avoid restarting when the user refreshes mid-walk.
+                // Cross-tab lock — skip if another walk started in the last 3 min UNLESS the caller
+                // explicitly forced a refresh (e.g. Settings → Refresh button).
                 const LOCK_KEY = 'bospage_index_lock';
                 const LOCK_TTL_MS = 3 * 60 * 1000;
-                try {
-                    const lockTs = parseInt(storage.get(LOCK_KEY, '0'), 10);
-                    if (lockTs && Date.now() - lockTs < LOCK_TTL_MS) {
-                        console.log('[Bos Page] Skipping index — another walk is in progress (started ' + Math.round((Date.now() - lockTs) / 1000) + 's ago)');
-                        setIndexStatus('Indexing… (another tab is walking)');
-                        return;
-                    }
-                    storage.set(LOCK_KEY, String(Date.now()));
-                } catch {}
+                if (!opts.force) {
+                    try {
+                        const lockTs = parseInt(storage.get(LOCK_KEY, '0'), 10);
+                        if (lockTs && Date.now() - lockTs < LOCK_TTL_MS) {
+                            console.log('[Bos Page] Skipping index — another walk is in progress (started ' + Math.round((Date.now() - lockTs) / 1000) + 's ago)');
+                            setIndexStatus('Indexing… (another tab is walking)');
+                            return;
+                        }
+                    } catch {}
+                }
+                try { storage.set(LOCK_KEY, String(Date.now())); } catch {}
                 const MAX_EXAMPLES_PER_FOLDER = 10;
                 const FOLDER_MIME = 'application/vnd.google-apps.folder';
                 const folders = []; // { id, name, path, rootId, files: [names] }
