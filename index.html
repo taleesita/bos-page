@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.10-apr26 stale-while-revalidate';
+        const APP_VERSION = 'v3.13-apr26 refill-partial-cache';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -560,11 +560,11 @@
         // Extract a likely document date from extracted text. Returns {year, month, day} or null.
         const extractDocDate = (text) => {
             if (!text) return null;
-            // YYYY-MM-DD or YYYY/MM/DD
-            let m = text.match(/\b(20\d{2})[-\/](0?[1-9]|1[0-2])[-\/](0?[1-9]|[12]\d|3[01])\b/);
+            // YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD
+            let m = text.match(/\b(20\d{2})[-\/.](0?[1-9]|1[0-2])[-\/.](0?[1-9]|[12]\d|3[01])\b/);
             if (m) return { year: m[1], month: m[2].padStart(2, '0'), day: m[3].padStart(2, '0') };
-            // MM/DD/YYYY
-            m = text.match(/\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/(20\d{2})\b/);
+            // MM/DD/YYYY or MM.DD.YYYY or MM-DD-YYYY
+            m = text.match(/\b(0?[1-9]|1[0-2])[\/.\-](0?[1-9]|[12]\d|3[01])[\/.\-](20\d{2})\b/);
             if (m) return { year: m[3], month: m[1].padStart(2, '0'), day: m[2].padStart(2, '0') };
             // Month DD, YYYY
             const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
@@ -573,6 +573,13 @@
             if (m) {
                 const mo = months.indexOf(m[1].toLowerCase()) + 1;
                 return { year: m[3], month: String(mo).padStart(2, '0'), day: m[2].padStart(2, '0') };
+            }
+            // Month YYYY (no day) — "May 2026"
+            const mRegex2 = new RegExp(`\\b(${months.join('|')})\\s+(20\\d{2})\\b`, 'i');
+            m = text.match(mRegex2);
+            if (m) {
+                const mo = months.indexOf(m[1].toLowerCase()) + 1;
+                return { year: m[2], month: String(mo).padStart(2, '0'), day: '01' };
             }
             return null;
         };
@@ -710,9 +717,19 @@
                 let note = '';
 
                 if (docDate) {
-                    // Date-bearing pattern (YYYY-MM, YYYY-MM-DD) → swap in doc's date
-                    adapted = adapted.replace(/\b20\d{2}[-\/]\d{2}[-\/]\d{2}\b/, `${docDate.year}-${docDate.month}-${docDate.day}`);
-                    adapted = adapted.replace(/\b20\d{2}[-\/]\d{2}\b/, `${docDate.year}-${docDate.month}`);
+                    // Detect date pattern in template AND preserve its separator style.
+                    // Handles: YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, YYYY-MM, YYYY.MM, YYYY_MM etc.
+                    const fullMatch = adapted.match(/\b(20\d{2})([-\/._])(\d{2})\2(\d{2})\b/);
+                    if (fullMatch) {
+                        const sep = fullMatch[2];
+                        adapted = adapted.replace(fullMatch[0], `${docDate.year}${sep}${docDate.month}${sep}${docDate.day}`);
+                    } else {
+                        const monthMatch = adapted.match(/\b(20\d{2})([-\/._])(\d{2})\b/);
+                        if (monthMatch) {
+                            const sep = monthMatch[2];
+                            adapted = adapted.replace(monthMatch[0], `${docDate.year}${sep}${docDate.month}`);
+                        }
+                    }
                     if (adapted !== exampleBase) {
                         note = `adapted from "${example}" using doc date ${docDate.year}-${docDate.month}-${docDate.day}`;
                     }
@@ -2161,6 +2178,19 @@ Respond with STRICT JSON ONLY matching this schema:
             // and up to MAX_EXAMPLES filenames per folder. Cached in localStorage.
             const refreshIndex = useCallback(async () => {
                 if (!token) return;
+                // Cross-tab lock — if another tab/refresh started a walk in the last 3 min, skip
+                // to avoid restarting when the user refreshes mid-walk.
+                const LOCK_KEY = 'bospage_index_lock';
+                const LOCK_TTL_MS = 3 * 60 * 1000;
+                try {
+                    const lockTs = parseInt(storage.get(LOCK_KEY, '0'), 10);
+                    if (lockTs && Date.now() - lockTs < LOCK_TTL_MS) {
+                        console.log('[Bos Page] Skipping index — another walk is in progress (started ' + Math.round((Date.now() - lockTs) / 1000) + 's ago)');
+                        setIndexStatus('Indexing… (another tab is walking)');
+                        return;
+                    }
+                    storage.set(LOCK_KEY, String(Date.now()));
+                } catch {}
                 const MAX_EXAMPLES_PER_FOLDER = 10;
                 const FOLDER_MIME = 'application/vnd.google-apps.folder';
                 const folders = []; // { id, name, path, rootId, files: [names] }
@@ -2254,6 +2284,12 @@ Respond with STRICT JSON ONLY matching this schema:
                         folderCount++;
                         setIndexStatus(`Indexing… ${folderCount} folders, ${fileCount} files`);
                     }
+                    // After each root completes, snapshot progress so a page refresh mid-walk
+                    // doesn't lose everything. Timestamp uses old value so the useEffect still
+                    // treats it as "stale" and re-walks on next load — but at least we have data.
+                    try {
+                        storage.setJSON(STORAGE_KEYS.folderIndex, { folders: [...folders], indexedAt: Date.now(), partial: true });
+                    } catch {}
                 };
 
                 try {
@@ -2282,6 +2318,9 @@ Respond with STRICT JSON ONLY matching this schema:
                     setIndexStatus(`${folderCount} folders · ${fileCount} files · just now`);
                 } catch (e) {
                     setIndexStatus('Index failed: ' + e.message);
+                } finally {
+                    // Release the cross-tab lock so future walks can start
+                    try { storage.del('bospage_index_lock'); } catch {}
                 }
             }, [token]);
 
@@ -2291,7 +2330,7 @@ Respond with STRICT JSON ONLY matching this schema:
             useEffect(() => {
                 if (!token) return;
                 const ts = parseInt(storage.get(STORAGE_KEYS.folderIndexTs, '0'), 10);
-                const needsFullFill = !folderIndex || folderIndex._migratedFromV1;
+                const needsFullFill = !folderIndex || folderIndex._migratedFromV1 || folderIndex.partial;
                 const isStale = Date.now() - ts > INDEX_TTL_MS;
                 if (needsFullFill || isStale) {
                     // Fire background refresh; existing folderIndex state remains valid meanwhile
