@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.14-apr26 force-refresh';
+        const APP_VERSION = 'v3.15-apr26 resumable-walks';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -2195,35 +2195,71 @@ Respond with STRICT JSON ONLY matching this schema:
                 try { storage.set(LOCK_KEY, String(Date.now())); } catch {}
                 const MAX_EXAMPLES_PER_FOLDER = 10;
                 const FOLDER_MIME = 'application/vnd.google-apps.folder';
-                const folders = []; // { id, name, path, rootId, files: [names] }
-                const visited = new Set(); // folder IDs we've already walked — prevents duplicate walks
-                const hashCandidates = []; // { hash, filename, folderId, folderPath, webViewLink, when }
-                // Set of all designated root folder IDs — used to prevent one root's BFS
-                // from "claiming" another root that happens to be reachable as its child
-                // (Drive allows shared parents, so this can happen).
                 const rootIdSet = new Set(ROOT_FOLDER_IDS);
-                let folderCount = 0;
-                let fileCount = 0;
+                // Resumability: start from existing cached data (unless force-reset).
+                const existing = opts.force ? null : folderIndex;
+                const folders = existing?.folders ? [...existing.folders] : [];
+                const visited = new Set(folders.map(f => f.id));
+                const completedRoots = new Set(opts.force ? [] : (existing?.completedRoots || []));
+                const hashCandidates = [];
+                let folderCount = folders.length;
+                let fileCount = folders.reduce((s, f) => s + (f.files?.length || 0), 0);
+                let listingFailures = 0;
+                let currentToken = token;
 
-                setIndexStatus('Starting index…');
+                setIndexStatus(existing?.folders?.length
+                    ? `Resuming from ${folders.length} folders…`
+                    : 'Starting index…');
+
+                // Wrap a Drive API call with a one-time 401 retry (re-request token silently)
+                const withTokenRetry = async (apiFn) => {
+                    try { return await apiFn(currentToken); }
+                    catch (e) {
+                        const msg = String(e.message || e);
+                        if (!msg.includes('401') && !msg.includes('Unauthorized')) throw e;
+                        console.warn('[Bos Page] 401 during walk — refreshing token');
+                        const fresh = await refreshToken();
+                        if (!fresh) throw e;
+                        currentToken = fresh;
+                        return await apiFn(currentToken);
+                    }
+                };
 
                 // Fetch all children of a folder, paginating
                 const getAllChildren = async (folderId) => {
                     let all = [];
                     let pageToken = undefined;
                     do {
-                        const data = await drive.listChildren(token, folderId, pageToken);
+                        const data = await withTokenRetry(t => drive.listChildren(t, folderId, pageToken));
                         all = all.concat(data.files || []);
                         pageToken = data.nextPageToken;
                     } while (pageToken);
                     return all;
                 };
 
+                // Save current progress to localStorage — call often so an interrupted walk
+                // preserves as much as possible.
+                const SAVE_EVERY_N = 30;
+                const savePartial = () => {
+                    try {
+                        storage.setJSON(STORAGE_KEYS.folderIndex, {
+                            folders: [...folders],
+                            indexedAt: Date.now(),
+                            partial: completedRoots.size < ROOT_FOLDER_IDS.length,
+                            completedRoots: [...completedRoots],
+                        });
+                    } catch {}
+                };
+
                 // BFS from a root folder
                 const walkRoot = async (rootId) => {
+                    if (completedRoots.has(rootId)) {
+                        console.log(`[Bos Page] Skipping already-completed root ${rootId}`);
+                        return;
+                    }
                     let rootMeta;
                     try {
-                        rootMeta = await drive.getMeta(token, rootId);
+                        rootMeta = await withTokenRetry(t => drive.getMeta(t, rootId));
                     } catch (e) {
                         console.warn(`[Bos Page] Root ${rootId} failed to fetch:`, e.message);
                         return;
@@ -2242,7 +2278,8 @@ Respond with STRICT JSON ONLY matching this schema:
                         try {
                             children = await getAllChildren(cur.id);
                         } catch (e) {
-                            console.warn('Failed to list', cur.path, e);
+                            console.warn('Failed to list', cur.path, e.message || e);
+                            listingFailures++;
                             continue;
                         }
                         const fileNames = [];
@@ -2285,26 +2322,33 @@ Respond with STRICT JSON ONLY matching this schema:
                         });
                         folderCount++;
                         setIndexStatus(`Indexing… ${folderCount} folders, ${fileCount} files`);
+                        // Snapshot every N folders so an interruption only loses ~30 folders of work
+                        if (folderCount % SAVE_EVERY_N === 0) savePartial();
                     }
-                    // After each root completes, snapshot progress so a page refresh mid-walk
-                    // doesn't lose everything. Timestamp uses old value so the useEffect still
-                    // treats it as "stale" and re-walks on next load — but at least we have data.
-                    try {
-                        storage.setJSON(STORAGE_KEYS.folderIndex, { folders: [...folders], indexedAt: Date.now(), partial: true });
-                    } catch {}
+                    // Root fully walked — mark complete so a re-walk skips it entirely
+                    completedRoots.add(rootId);
+                    savePartial();
                 };
 
                 try {
                     // Roots in parallel, BFS within each root is sequential to respect rate limits
                     await Promise.all(ROOT_FOLDER_IDS.map(walkRoot));
-                    const idx = { folders, indexedAt: Date.now() };
+                    const allRootsDone = completedRoots.size >= ROOT_FOLDER_IDS.length;
+                    const idx = {
+                        folders,
+                        indexedAt: Date.now(),
+                        partial: !allRootsDone,
+                        completedRoots: [...completedRoots],
+                    };
                     setFolderIndex(idx);
                     try {
                         storage.setJSON(STORAGE_KEYS.folderIndex, idx);
-                        storage.set(STORAGE_KEYS.folderIndexTs, String(Date.now()));
+                        if (allRootsDone) storage.set(STORAGE_KEYS.folderIndexTs, String(Date.now()));
                     } catch (e) {
-                        // If localStorage overflows (big index), keep in-memory only
                         console.warn('Index too big to cache, keeping in memory only', e);
+                    }
+                    if (listingFailures > 0) {
+                        console.warn(`[Bos Page] Walk completed with ${listingFailures} folder-listing failures — some subtrees may be incomplete`);
                     }
                     // Build/save Drive hash index — sorted by recency, top 5000 only
                     try {
@@ -2324,7 +2368,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     // Release the cross-tab lock so future walks can start
                     try { storage.del('bospage_index_lock'); } catch {}
                 }
-            }, [token]);
+            }, [token, refreshToken, folderIndex]);
 
             // Stale-while-revalidate: on token acquisition, show cached index immediately
             // and kick off a background refresh only when cache is missing OR older than 24h.
