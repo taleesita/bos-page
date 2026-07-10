@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.15-apr26 resumable-walks';
+        const APP_VERSION = 'v3.16-apr26 401-retry-everywhere';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -177,6 +177,29 @@
         // ============================================================
         // GOOGLE DRIVE API WRAPPERS
         // ============================================================
+        // Module-level auth state — useAuth writes into these so ANY Drive call can
+        // silently refresh on 401 without threading tokens through props.
+        const _driveAuth = {
+            token: null,
+            refresh: null, // async () => newToken (populated by useAuth on mount)
+        };
+
+        // Wrap a Drive API call so it auto-retries once on 401 by refreshing the token.
+        const driveCall = async (apiFn) => {
+            try {
+                return await apiFn(_driveAuth.token);
+            } catch (e) {
+                const msg = String(e.message || e);
+                if (!msg.includes('401') && !msg.includes('Unauthorized') && !msg.includes('UNAUTHENTICATED')) throw e;
+                if (!_driveAuth.refresh) throw e;
+                console.warn('[Bos Page] Drive 401 — refreshing token silently');
+                const fresh = await _driveAuth.refresh();
+                if (!fresh) throw e;
+                _driveAuth.token = fresh;
+                return await apiFn(fresh);
+            }
+        };
+
         const drive = {
             // List children of a folder (supports pagination)
             listChildren: async (token, folderId, pageToken) => {
@@ -1028,9 +1051,32 @@ Respond with STRICT JSON ONLY matching this schema:
             const persistToken = (accessToken, expiresInSec) => {
                 const expiry = Date.now() + Math.max(60, (expiresInSec || 3600) - 300) * 1000;
                 setToken(accessToken);
+                _driveAuth.token = accessToken; // keep module-level ref in sync so driveCall can use it
                 storage.set(STORAGE_KEYS.accessToken, accessToken);
                 storage.set(STORAGE_KEYS.accessTokenExpiry, String(expiry));
             };
+
+            // Keep _driveAuth in sync with token state (also on initial hydrate) and expose
+            // a silent-refresh function so driveCall can auto-retry on 401.
+            useEffect(() => {
+                _driveAuth.token = token;
+            }, [token]);
+            useEffect(() => {
+                _driveAuth.refresh = async () => {
+                    try {
+                        const email = user?.email;
+                        const resp = await requestAccessToken('', email); // silent
+                        if (resp?.access_token) {
+                            persistToken(resp.access_token, resp.expires_in);
+                            return resp.access_token;
+                        }
+                    } catch (e) {
+                        console.warn('[Bos Page] Silent refresh in driveCall failed:', e.message);
+                    }
+                    return null;
+                };
+                return () => { _driveAuth.refresh = null; };
+            }, [user]);
 
             const persistUser = (email, name) => {
                 const u = { email, displayName: name || email };
@@ -1647,7 +1693,7 @@ Respond with STRICT JSON ONLY matching this schema:
                         ? TEST_PARENT_FOLDER_ID
                         : it.edits.folderId;
                     const filename = testMode ? `[TEST] ${it.edits.filename}` : it.edits.filename;
-                    const uploaded = await drive.uploadNew(token, it.file, filename, targetFolderId);
+                    const uploaded = await driveCall(t => drive.uploadNew(t, it.file, filename, targetFolderId));
                     updateItem(it.id, {
                         status: 'done',
                         edits: { ...it.edits, filename },
@@ -1803,11 +1849,14 @@ Respond with STRICT JSON ONLY matching this schema:
                     q: `name = '${INTAKE_FOLDER_NAME.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
                     fields: 'files(id,name)',
                 });
-                const resp = await fetch(`https://www.googleapis.com/drive/v3/files?${params}`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (!resp.ok) throw new Error(`Drive search failed: ${resp.status}`);
-                const data = await resp.json();
+                const doCall = async (t) => {
+                    const resp = await fetch(`https://www.googleapis.com/drive/v3/files?${params}`, {
+                        headers: { Authorization: `Bearer ${t}` },
+                    });
+                    if (!resp.ok) throw new Error(`Drive search failed: ${resp.status}`);
+                    return resp.json();
+                };
+                const data = await driveCall(doCall);
                 return data.files?.[0]?.id || null;
             };
 
@@ -1825,7 +1874,7 @@ Respond with STRICT JSON ONLY matching this schema:
                         setError(`No "${INTAKE_FOLDER_NAME}" folder found. Once the Apps Script runs once it'll be created automatically.`);
                         return;
                     }
-                    const data = await drive.listChildren(token, folderId);
+                    const data = await driveCall(t => drive.listChildren(t, folderId));
                     const files = (data.files || []).filter(f => f.mimeType !== 'application/vnd.google-apps.folder');
                     // Convert to item shape with empty proposal — user needs to process each
                     setItems(files.map(f => ({
@@ -1854,7 +1903,7 @@ Respond with STRICT JSON ONLY matching this schema:
                 if (!apiKey) { alert('Add a Gemini API key in Settings first.'); return; }
                 setItems(prev => prev.map(x => x.id === itemId ? { ...x, status: 'processing' } : x));
                 try {
-                    const blob = await drive.download(token, it.driveId);
+                    const blob = await driveCall(t => drive.download(t, it.driveId));
                     const file = new File([blob], it.originalName, { type: it.mimeType });
                     const payload = await prepareFileForNaming(file);
                     const proposal = await callGemini(apiKey, payload, folderIndex, it.originalName);
@@ -1885,9 +1934,9 @@ Respond with STRICT JSON ONLY matching this schema:
                     const targetFolderId = testMode && TEST_PARENT_FOLDER_ID ? TEST_PARENT_FOLDER_ID : it.edits.folderId;
                     const filename = testMode ? `[TEST] ${it.edits.filename}` : it.edits.filename;
                     // Move (change parent) + rename, since file is already in Drive
-                    const updated = await drive.renameAndMove(
-                        token, it.driveId, filename, targetFolderId, [intakeFolderId]
-                    );
+                    const updated = await driveCall(t => drive.renameAndMove(
+                        t, it.driveId, filename, targetFolderId, [intakeFolderId]
+                    ));
                     setItems(prev => prev.map(x => x.id === itemId ? {
                         ...x,
                         status: 'done',
