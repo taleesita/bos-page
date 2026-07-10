@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.16-apr26 401-retry-everywhere';
+        const APP_VERSION = 'v3.17-apr26 concurrency+nav-fix';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -1191,7 +1191,7 @@ Respond with STRICT JSON ONLY matching this schema:
         ];
 
         const TabBar = ({ activeTab, setActiveTab }) => (
-            <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-slate-200 pb-safe z-20 md:static md:border-none md:bg-transparent">
+            <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-slate-200 pb-safe z-20">
                 <div className="max-w-2xl mx-auto flex md:justify-center md:gap-2">
                     {TABS.map(t => (
                         <button
@@ -1776,7 +1776,7 @@ Respond with STRICT JSON ONLY matching this schema:
                     />
 
                     {items.length > 0 && (
-                        <div className="mt-6 space-y-3 pb-24">
+                        <div className="mt-6 space-y-3 pb-40">
                             <div className="flex items-center justify-between">
                                 <h3 className="text-sm font-semibold text-slate-700">
                                     {items.length} file{items.length === 1 ? '' : 's'}
@@ -1807,7 +1807,7 @@ Respond with STRICT JSON ONLY matching this schema:
                         const readyItems = items.filter(x => x.status === 'ready' && x.edits.folderId && x.edits.filename);
                         if (readyItems.length < 2) return null;
                         return (
-                            <div className="fixed bottom-16 md:bottom-4 inset-x-0 z-30 px-4 pointer-events-none">
+                            <div className="fixed bottom-20 md:bottom-20 inset-x-0 z-30 px-4 pointer-events-none">
                                 <div className="max-w-2xl mx-auto pointer-events-auto">
                                     <button
                                         onClick={handleConfirmAll}
@@ -2319,23 +2319,23 @@ Respond with STRICT JSON ONLY matching this schema:
                         return;
                     }
                     const queue = [{ id: rootMeta.id, name: rootMeta.name, path: rootMeta.name, rootId: rootMeta.id }];
-                    while (queue.length) {
-                        const cur = queue.shift();
-                        if (visited.has(cur.id)) continue; // dedup: folder might be shared across multiple parents
-                        visited.add(cur.id);
+                    let rootFailures = 0;
+                    let activeWorkers = 0;
+
+                    // Process a single folder node — pull children, queue subfolders, capture files
+                    const processNode = async (cur) => {
                         let children;
                         try {
                             children = await getAllChildren(cur.id);
                         } catch (e) {
                             console.warn('Failed to list', cur.path, e.message || e);
                             listingFailures++;
-                            continue;
+                            rootFailures++;
+                            return;
                         }
                         const fileNames = [];
                         for (const c of children) {
                             if (c.mimeType === FOLDER_MIME) {
-                                // Skip designated roots — they'll be walked by their own walkRoot call,
-                                // giving them their own root-level path instead of inheriting this parent's.
                                 if (!visited.has(c.id) && !rootIdSet.has(c.id)) {
                                     queue.push({
                                         id: c.id,
@@ -2347,7 +2347,6 @@ Respond with STRICT JSON ONLY matching this schema:
                             } else {
                                 fileNames.push(c.name);
                                 fileCount++;
-                                // Capture hash for dupe detection if Drive provided one
                                 if (c.sha256Checksum) {
                                     hashCandidates.push({
                                         hash: c.sha256Checksum,
@@ -2360,7 +2359,6 @@ Respond with STRICT JSON ONLY matching this schema:
                                 }
                             }
                         }
-                        // Keep a cap per-folder so the LLM context doesn't blow up
                         const examples = fileNames.slice(-MAX_EXAMPLES_PER_FOLDER);
                         folders.push({
                             id: cur.id,
@@ -2371,11 +2369,37 @@ Respond with STRICT JSON ONLY matching this schema:
                         });
                         folderCount++;
                         setIndexStatus(`Indexing… ${folderCount} folders, ${fileCount} files`);
-                        // Snapshot every N folders so an interruption only loses ~30 folders of work
                         if (folderCount % SAVE_EVERY_N === 0) savePartial();
+                    };
+
+                    // Concurrent workers — pull from shared queue in parallel.
+                    // JS is single-threaded so visited.has + add is atomic; no lock needed.
+                    const WORKERS_PER_ROOT = 5;
+                    const worker = async () => {
+                        while (true) {
+                            if (queue.length === 0) {
+                                if (activeWorkers === 0) return; // no more work incoming
+                                await new Promise(r => setTimeout(r, 20));
+                                continue;
+                            }
+                            const cur = queue.shift();
+                            if (!cur || visited.has(cur.id)) continue;
+                            visited.add(cur.id);
+                            activeWorkers++;
+                            try { await processNode(cur); }
+                            catch (e) { console.warn('processNode err', e); }
+                            finally { activeWorkers--; }
+                        }
+                    };
+                    await Promise.all(Array(WORKERS_PER_ROOT).fill(null).map(worker));
+
+                    // Only mark root as completed if NO listing failed. Otherwise leave it
+                    // uncompleted so next walk re-tries the missing subtrees.
+                    if (rootFailures === 0) {
+                        completedRoots.add(rootId);
+                    } else {
+                        console.warn(`[Bos Page] Root ${rootMeta.name} had ${rootFailures} listing failures — will retry on next walk`);
                     }
-                    // Root fully walked — mark complete so a re-walk skips it entirely
-                    completedRoots.add(rootId);
                     savePartial();
                 };
 
@@ -2481,7 +2505,7 @@ Respond with STRICT JSON ONLY matching this schema:
             const tabProps = { token, folderIndex, refreshIndex, apiKey, testMode };
 
             return (
-                <div className="min-h-screen pb-20 md:pb-4">
+                <div className="min-h-screen pb-32">
                     <Header user={user} testMode={testMode} indexStatus={indexStatus} />
                     <main className="max-w-2xl mx-auto">
                         {activeTab === 'upload' && <UploadTab {...tabProps} />}
