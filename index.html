@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.20-oct21 taly-conventions';
+        const APP_VERSION = 'v3.22-oct21 plain-english';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -2305,13 +2305,15 @@ Respond with STRICT JSON ONLY matching this schema:
                 // Cross-tab lock — skip if another walk started in the last 3 min UNLESS the caller
                 // explicitly forced a refresh (e.g. Settings → Refresh button).
                 const LOCK_KEY = 'bospage_index_lock';
-                const LOCK_TTL_MS = 3 * 60 * 1000;
+                // Short TTL — live walks refresh the lock via savePartial as a heartbeat.
+                // Dead walks (crashed, tab closed) leave a stale lock that expires in 60s.
+                const LOCK_TTL_MS = 60 * 1000;
                 if (!opts.force) {
                     try {
                         const lockTs = parseInt(storage.get(LOCK_KEY, '0'), 10);
                         if (lockTs && Date.now() - lockTs < LOCK_TTL_MS) {
-                            console.log('[Bos Page] Skipping index — another walk is in progress (started ' + Math.round((Date.now() - lockTs) / 1000) + 's ago)');
-                            setIndexStatus('Indexing… (another tab is walking)');
+                            console.log('[Bos Page] Skipping index — another tab is already indexing (started ' + Math.round((Date.now() - lockTs) / 1000) + 's ago)');
+                            setIndexStatus('Another tab is already indexing — hang on…');
                             return;
                         }
                     } catch {}
@@ -2363,7 +2365,8 @@ Respond with STRICT JSON ONLY matching this schema:
 
                 // Save current progress to localStorage AND update React state so files dropped
                 // during the walk can process against partial data instead of waiting on an
-                // empty index.
+                // empty index. Also refreshes the cross-tab lock as a heartbeat so dead walks
+                // (interrupted mid-run) release their lock within the 60s TTL.
                 const SAVE_EVERY_N = 30;
                 const savePartial = () => {
                     const snapshot = {
@@ -2373,7 +2376,10 @@ Respond with STRICT JSON ONLY matching this schema:
                         completedRoots: [...completedRoots],
                     };
                     setFolderIndex(snapshot);
-                    try { storage.setJSON(STORAGE_KEYS.folderIndex, snapshot); } catch {}
+                    try {
+                        storage.setJSON(STORAGE_KEYS.folderIndex, snapshot);
+                        storage.set(LOCK_KEY, String(Date.now())); // heartbeat
+                    } catch {}
                 };
 
                 // BFS from a root folder
