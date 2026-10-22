@@ -61,7 +61,7 @@
         // ============================================================
         // CONSTANTS
         // ============================================================
-        const APP_VERSION = 'v3.18-oct21 userinfo-scopes';
+        const APP_VERSION = 'v3.20-oct21 taly-conventions';
 
         // OAuth 2.0 Web Client ID from Google Cloud Console (auto-created by Firebase).
         // Used by Google Identity Services (GIS) TokenClient for Drive access tokens.
@@ -586,6 +586,36 @@
             );
         };
 
+        // Taly's filename conventions, learned from 30 actual filings 2026-10-21.
+        // Used as the default format when there's no folder template to copy from.
+        //   receipt   → YYYY.MM.DD - Vendor.pdf
+        //   manual    → Brand - Product.pdf           (no date — this is deliberate)
+        //   card      → YYYY.MM.DD - Occasion.pdf
+        //   subscription → YYYY.MM - Publisher.pdf
+        const detectDocPattern = (text) => {
+            if (!text) return null;
+            const lower = text.toLowerCase();
+            // Order: cards first (they can have dates + "happy X"), then manuals (packaging text),
+            // then receipts (order #/invoice), then subscriptions (newsletter indicators)
+            if (/\b(happy\s+(birthday|anniversary|holidays|hanukkah)|congratulations|wishing\s+you|get\s+well)\b/.test(lower)) {
+                return 'card';
+            }
+            if (/\b(instruction\s+manual|user\s+(manual|guide|booklet)|owner'?s\s+manual|installation\s+guide|quick\s+start|setup\s+guide|warranty|operating\s+manual|made\s+in\s+(china|usa|vietnam|india|germany)|manufactured\s+by|distributed\s+by|patent\s+pending|model\s+(no|number)|serial\s+number)\b/.test(lower)) {
+                return 'manual';
+            }
+            if (/\b(order\s+(number|#|no|date)|invoice\s+(number|#|no)|packing\s+slip|tracking\s+(number|#)|subtotal|ship\s+to|shipped|marketplace|sku|amount\s+due|total\s+amount)\b/.test(lower)) {
+                return 'receipt';
+            }
+            if (/\b(newsletter|monthly\s+issue|volume\s+\d+|issue\s+\d+)\b/.test(lower)) {
+                return 'subscription';
+            }
+            return null;
+        };
+
+        // Format date in Taly's preferred dot form.
+        const dotDate = (d, includeDay = true) =>
+            includeDay ? `${d.year}.${d.month}.${d.day}` : `${d.year}.${d.month}`;
+
         // Extract a likely document date from extracted text. Returns {year, month, day} or null.
         const extractDocDate = (text) => {
             if (!text) return null;
@@ -633,20 +663,22 @@
                 'pediatricians','dermatologists','adults','kids','baby','adult','men','women','daily','weekly',
                 'appreciate','company','manual','guide','instructions',
             ]);
-            // 1–3 word phrases, any case, 3+ chars per word
+            // 1–3 word phrases, any case, 3+ chars per word.
+            // Track original casings so we can preserve "lalalark" / "L.L.Bean" / "iPhone".
             const counts = new Map();
-            const re = /\b([a-zA-Z][a-zA-Z0-9]{2,}(?:\s+[a-zA-Z][a-zA-Z0-9]{2,}){0,2})\b/g;
+            const originals = new Map(); // key → Map(originalForm → count)
+            const re = /\b([a-zA-Z][a-zA-Z0-9.\-]{2,}(?:\s+[a-zA-Z][a-zA-Z0-9.\-]{2,}){0,2})\b/g;
             let m;
             while ((m = re.exec(head))) {
                 const phrase = m[1].trim();
                 const words = phrase.split(/\s+/);
-                // Skip if any word is a stop word
                 if (words.some(p => stop.has(p.toLowerCase()))) continue;
-                // Skip single super-long words (chemical names, ingredient lists)
                 if (words.length === 1 && words[0].length > 18) continue;
-                // Use lowercase key so "Tiny Twinkle" and "tiny twinkle" tally together
                 const key = phrase.toLowerCase();
                 counts.set(key, (counts.get(key) || 0) + 1);
+                if (!originals.has(key)) originals.set(key, new Map());
+                const forms = originals.get(key);
+                forms.set(phrase, (forms.get(phrase) || 0) + 1);
             }
             // Need at least 2 mentions; pick highest by frequency × length
             let companyKey = null, bestScore = 0;
@@ -655,8 +687,16 @@
                 const score = c * 10 + k.length;
                 if (score > bestScore) { bestScore = score; companyKey = k; }
             }
-            const titleCase = (s) => s.split(/\s+/).map(p => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join(' ');
-            const company = companyKey ? titleCase(companyKey) : null;
+            // Preserve brand's actual casing — pick the most-common original form
+            let company = null;
+            if (companyKey) {
+                const forms = originals.get(companyKey);
+                let topForm = null, topCount = 0;
+                for (const [form, cnt] of forms) {
+                    if (cnt > topCount) { topCount = cnt; topForm = form; }
+                }
+                company = topForm;
+            }
             // Doc type detection
             let type = null;
             const typeMatch = head.match(/\b(instruction\s+manual|user\s+(?:manual|guide)|owner'?s\s+manual|installation\s+guide|quick\s+start(?:\s+guide)?|warranty|instructions?|reference\s+guide|setup\s+guide|user\s+booklet)\b/i);
@@ -713,27 +753,54 @@
             const ext = (originalFilename.match(/\.[a-z0-9]+$/i) || [''])[0];
             const baseOriginal = originalFilename.replace(/\.[a-z0-9]+$/i, '');
             const docDate = extractDocDate(docText);
+            const docPattern = detectDocPattern(docText);
             let filename = originalFilename;
             let reasoning;
 
-            // No folder keyword match — don't guess the folder, but still try to suggest a filename
-            if (topScore === 0) {
-                // Try the COMPANY - TYPE heuristic even without a folder match
+            // Format a filename by Taly's learned conventions (see memory /projects/.../project_bos_page_naming.md)
+            // Returns null if we don't have enough signal to format cleanly.
+            const formatByConvention = () => {
                 const { company, type } = guessCompanyAndType(docText);
-                let guessedFilename = originalFilename;
-                let why = 'No keyword overlap with any folder — pick a folder manually.';
-                if (company && type) {
-                    guessedFilename = `${company} - ${type}${ext}`;
-                    why = `No folder matched. Guessed "${company} - ${type}" from document text — adjust as needed.`;
-                } else if (company) {
-                    guessedFilename = `${company}${ext}`;
-                    why = `No folder matched. Detected "${company}" in document — filename is a rough guess.`;
+                if (docPattern === 'receipt' && docDate && company) {
+                    return { name: `${dotDate(docDate)} - ${company}${ext}`,
+                             note: `receipt pattern: date + vendor "${company}"` };
                 }
+                if (docPattern === 'manual' && company && type) {
+                    return { name: `${company} - ${type}${ext}`,
+                             note: `manual pattern: brand "${company}" + "${type}"` };
+                }
+                if (docPattern === 'manual' && company) {
+                    return { name: `${company}${ext}`,
+                             note: `manual pattern: brand "${company}" (add doc type manually)` };
+                }
+                if (docPattern === 'card' && docDate) {
+                    return { name: `${dotDate(docDate)} - ${baseOriginal}${ext}`,
+                             note: `card pattern: dated — add occasion/person after date` };
+                }
+                if (docPattern === 'subscription' && docDate && company) {
+                    return { name: `${dotDate(docDate, false)} - ${company}${ext}`,
+                             note: `subscription pattern: YYYY.MM + publisher "${company}"` };
+                }
+                if (company && type) {
+                    return { name: `${company} - ${type}${ext}`, note: `detected "${company}" / "${type}"` };
+                }
+                if (company) {
+                    return { name: `${company}${ext}`, note: `detected brand "${company}"` };
+                }
+                return null;
+            };
+
+            // No folder keyword match — don't guess the folder, but still try to format a filename
+            // by Taly's conventions based on what the doc looks like.
+            if (topScore === 0) {
+                const guess = formatByConvention();
                 return {
                     folder_path: '',
-                    filename: guessedFilename,
+                    filename: guess ? guess.name : originalFilename,
                     confidence: 0.1,
-                    reasoning: why,
+                    reasoning: guess
+                        ? `No folder matched. Suggested "${guess.name}" (${guess.note}) — pick folder manually.`
+                        : 'No keyword overlap with any folder, no identifiable info in doc. Pick folder and edit name manually.',
                 };
             }
 
@@ -783,26 +850,27 @@
                     filename = adapted + ext;
                     reasoning = `Matched "${topFolder.name}"; ${note}.`;
                 } else {
-                    // Couldn't adapt template. Try to build a name from the doc heuristic instead.
-                    const { company: c2, type: t2 } = guessCompanyAndType(docText);
-                    if (c2 && t2) {
-                        filename = `${c2} - ${t2}${ext}`;
-                        reasoning = `Matched "${topFolder.name}". Couldn't adapt template — used "${c2} - ${t2}" from document. Verify.`;
-                    } else if (c2) {
-                        filename = `${c2}${ext}`;
-                        reasoning = `Matched "${topFolder.name}". Found brand "${c2}" in document — please add doc type. Example: "${example}".`;
+                    // Couldn't adapt template. Fall back to Taly's learned filename conventions.
+                    const guess = formatByConvention();
+                    if (guess) {
+                        filename = guess.name;
+                        reasoning = `Matched "${topFolder.name}". Used convention (${guess.note}). Example in folder: "${example}".`;
                     } else {
                         filename = originalFilename;
                         reasoning = `Matched "${topFolder.name}". No identifiable info in doc. Example in folder: "${example}".`;
                     }
                 }
             } else if (topFolder) {
-                // Folder has no examples — fall back to docdate + original base
-                if (docDate) {
-                    filename = `${docDate.year}-${docDate.month}-${docDate.day} ${baseOriginal}${ext}`;
-                    reasoning = `Matched "${topFolder.name}" by keyword. Folder is empty — prefixed original name with doc date.`;
+                // Folder has no examples — fall back to convention (dot-dated per Taly's style)
+                const guess = formatByConvention();
+                if (guess) {
+                    filename = guess.name;
+                    reasoning = `Matched "${topFolder.name}" (folder is empty). Used convention: ${guess.note}.`;
+                } else if (docDate) {
+                    filename = `${dotDate(docDate)} - ${baseOriginal}${ext}`;
+                    reasoning = `Matched "${topFolder.name}" (folder is empty). Prefixed original name with doc date.`;
                 } else {
-                    reasoning = `Matched "${topFolder.name}" by keyword. Folder is empty, no date found — keeping original filename.`;
+                    reasoning = `Matched "${topFolder.name}" (folder is empty, no date found) — keeping original filename.`;
                 }
             } else {
                 reasoning = `No keyword match. Pick a folder and adjust filename manually.`;
@@ -1118,8 +1186,9 @@ Respond with STRICT JSON ONLY matching this schema:
                 if (current && window.google?.accounts?.oauth2) {
                     try { google.accounts.oauth2.revoke(current, () => {}); } catch {}
                 }
+                // Keep folderIndex cached across sign-outs — the tree is the same for both allowlisted
+                // users and re-walking costs 2-10 min. Clear auth + user info only.
                 [STORAGE_KEYS.accessToken, STORAGE_KEYS.accessTokenExpiry,
-                 STORAGE_KEYS.folderIndex, STORAGE_KEYS.folderIndexTs,
                  STORAGE_KEYS.userEmail, STORAGE_KEYS.userName].forEach(k => storage.del(k));
                 setToken(null);
                 setUser(null);
@@ -2292,18 +2361,19 @@ Respond with STRICT JSON ONLY matching this schema:
                     return all;
                 };
 
-                // Save current progress to localStorage — call often so an interrupted walk
-                // preserves as much as possible.
+                // Save current progress to localStorage AND update React state so files dropped
+                // during the walk can process against partial data instead of waiting on an
+                // empty index.
                 const SAVE_EVERY_N = 30;
                 const savePartial = () => {
-                    try {
-                        storage.setJSON(STORAGE_KEYS.folderIndex, {
-                            folders: [...folders],
-                            indexedAt: Date.now(),
-                            partial: completedRoots.size < ROOT_FOLDER_IDS.length,
-                            completedRoots: [...completedRoots],
-                        });
-                    } catch {}
+                    const snapshot = {
+                        folders: [...folders],
+                        indexedAt: Date.now(),
+                        partial: completedRoots.size < ROOT_FOLDER_IDS.length,
+                        completedRoots: [...completedRoots],
+                    };
+                    setFolderIndex(snapshot);
+                    try { storage.setJSON(STORAGE_KEYS.folderIndex, snapshot); } catch {}
                 };
 
                 // BFS from a root folder
